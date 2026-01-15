@@ -795,12 +795,14 @@ static inline bool read_beam_P6() {
             bool rawValue = readPCF8574Pin(6); // P6
             Serial.print("IR receiver (P6) raw value: ");
             Serial.println(rawValue ? "HIGH" : "LOW");
-            bool beamBroken = rawValue; // HIGH = beam broken, LOW = intact
-         //   if (beamBroken) {
-         //       treatDispensed = true;
-         //       Serial.println("Beam broken! Treat dispensed.");
-         //       break;
-         //   }
+            
+            bool beamBroken = !rawValue; // HIGH = intact, LOW = beam broken -NL UPDATED
+
+            if (beamBroken) { //Add debounce if noisy or if treat is missed
+                treatDispensed = true;
+                Serial.println("Beam broken! Treat dispensed.");
+                break;
+            }
 
             int adcValue = analogRead(CURRENT_SENSOR_PIN);
             float voltage = (adcValue / 4095.0) * 4.0;  // Scale to ESP32 3.3V ADC
