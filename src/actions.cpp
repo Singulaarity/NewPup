@@ -77,6 +77,17 @@ static int current_treat_index = 0;
 static bool led_blink_mode = false;
 static bool led_is_on_solid = false;
 
+// Active Dispense and Rotary Switch Variables
+bool treatDispensed = false;
+
+bool lastRotary = readPCF8574Pin(2);   // initial rotary state
+int  lhTransitions = 0;                // LOW->HIGH transitions seen (only when no treat)
+
+bool stopRequested_NoTreat = false;    // set true after 3 transitions with no treat
+bool waitForNextHigh_AfterTreat = false;
+
+bool seenLowAfterTreat = false;        // ensures "next HIGH" after dispense, not "current HIGH"
+
 // Active-low LED helpers (place BEFORE usage)
 static inline void led_apply(bool on) {
     // on=true => drive low (active-low LED ON)
@@ -575,7 +586,7 @@ extern "C" {
         setPCF8574Pin(4, true); // LED OFF
         setPCF8574Pin(5, true); // IR transmitter OFF
 
-        Serial.println("Full stop: Motor, LED, and IR transmitter OFF");
+        Serial.println("Full stop: Motor and LED OFF");
     }
 
     //********* Start Motor EVERYTHING  */
@@ -609,7 +620,7 @@ static inline bool read_beam_P6() {
     beam_initial_state = read_beam_P6();
     Serial.println("IR Start - checking initial beam state:");
     Serial.print("Initial IR beam state (P6): ");
-    Serial.println(beam_initial_state ? "HIGH (unbroken?)" : "LOW (broken?)");
+    Serial.println(beam_initial_state ? "HIGH" : "LOW");
 }
 
     //********* Stop EVERYTHING  */
@@ -789,33 +800,83 @@ static inline bool read_beam_P6() {
         const unsigned long MOTOR_TIMEOUT = 5000; // 5 seconds
 
         bool treatDispensed = false;
+        
         unsigned long startTime = millis();
 
-        while (!treatDispensed && (millis() - startTime < MOTOR_TIMEOUT)) {
-            bool rawValue = readPCF8574Pin(6); // P6
-            Serial.print("IR receiver (P6) raw value: ");
-            Serial.println(rawValue ? "HIGH" : "LOW");
-            
-            bool beamBroken = !rawValue; // HIGH = intact, LOW = beam broken -NL UPDATED
+        // Reset attempt-scoped state (do this every Manual Treat attempt)
+        treatDispensed = false;
+        lhTransitions = 0;
+        stopRequested_NoTreat = false;
+        waitForNextHigh_AfterTreat = false;
+        seenLowAfterTreat = false;
 
-            if (beamBroken) { //Add debounce if noisy or if treat is missed
-                treatDispensed = true;
-                Serial.println("Beam broken! Treat dispensed.");
-                break;
+        // Seed edge detector to current rotary state to avoid a fake edge on first iteration
+        lastRotary = readPCF8574Pin(2);
+
+        while ((millis() - startTime) < MOTOR_TIMEOUT) {
+
+            bool rawValue     = readPCF8574Pin(6); // P6 IR Receiver (HIGH=intact, LOW=broken)
+            bool rotarySwitch = readPCF8574Pin(2); // P2 Rotary Switch (HIGH=safe-to-stop / blocking position)
+            bool beamBroken = !rawValue;
+
+            // --- 1) Treat detection ---
+            if (!treatDispensed && beamBroken) {
+            treatDispensed = true;
+
+            // Reset transition logic on dispense
+            lhTransitions = 0;
+            stopRequested_NoTreat = false;
+
+            // Now stop at NEXT HIGH
+            waitForNextHigh_AfterTreat = true;
+
+            // If currently HIGH, we must see LOW then HIGH to count as "next HIGH"
+            seenLowAfterTreat = !rotarySwitch;
+
+            Serial.println("Beam broken! Treat dispensed.");
             }
 
+            // --- 2) Rotary LOW->HIGH transition counting (ONLY if no treat yet) ---
+            if (!treatDispensed) {
+                if (!lastRotary && rotarySwitch) {          // LOW -> HIGH edge
+                lhTransitions++;
+                Serial.print("Rotary LOW->HIGH transitions: ");
+                Serial.println(lhTransitions);
+
+                if (lhTransitions >= 3) {
+                    stopRequested_NoTreat = true;           // stop at HIGH (now or next time it becomes HIGH)
+                }
+                }
+            }
+
+            // --- 3) Stop conditions ---
+            // A) Treat dispensed: stop at the NEXT high position
+            if (waitForNextHigh_AfterTreat) {
+                if (!seenLowAfterTreat) {
+                // We are waiting to see LOW at least once after dispense
+                if (!rotarySwitch) seenLowAfterTreat = true;
+                } else {
+                // Once we've seen LOW, the next HIGH is our stop point
+                if (rotarySwitch) {
+                    Serial.println("Stopping at NEXT HIGH after treat dispense.");
+                    break; // exit loop -> stop motor
+                }
+                }
+            }
+
+            // B) No treat after 3 transitions: stop when rotary is HIGH
+            if (stopRequested_NoTreat && rotarySwitch) {
+                Serial.println("No treat after 3 LOW->HIGH transitions. Stopping at HIGH.");
+                break; // exit loop -> stop motor
+            }
+
+            // --- 4) Optional: current monitoring (your existing code) ---
             int adcValue = analogRead(CURRENT_SENSOR_PIN);
-            float voltage = (adcValue / 4095.0) * 4.0;  // Scale to ESP32 3.3V ADC
+            float voltage = (adcValue / 4095.0) * 4.0;
             float current = (voltage - ZERO_CURRENT_VOLTAGE) / SENSITIVITY;
 
-            Serial.print("adcValue: ");
-            Serial.print(adcValue);
-            Serial.println(" V");
-            Serial.print(voltage);
-
-            Serial.print("Current: ");
-            Serial.print(current);
-            Serial.println(" A");
+            // Save state for edge detection next iteration
+            lastRotary = rotarySwitch;
         }
 
         // Stop motor and IR system
