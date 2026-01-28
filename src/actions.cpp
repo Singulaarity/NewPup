@@ -80,13 +80,125 @@ static bool led_is_on_solid = false;
 // Active Dispense and Rotary Switch Variables
 bool treatDispensed = false;
 
-bool lastRotary = readPCF8574Pin(2);   // initial rotary state
+bool lastRotary = false;   // initial rotary state
 int  lhTransitions = 0;                // LOW->HIGH transitions seen (only when no treat)
 
 bool stopRequested_NoTreat = false;    // set true after 3 transitions with no treat
 bool waitForNextHigh_AfterTreat = false;
 
 bool seenLowAfterTreat = false;        // ensures "next HIGH" after dispense, not "current HIGH"
+
+// ---------------------------------------------
+// Shared motor run logic (IR + Rotary Switch)
+// ---------------------------------------------
+
+enum MotorStopReason {
+    STOP_TIMEOUT = 0,
+    STOP_TREAT_NEXT_HIGH,
+    STOP_NO_TREAT_3_TRANSITIONS,
+    STOP_JAM,                // optional if you implement threshold
+    STOP_EXTERNAL_REQUEST
+};
+
+static inline void reset_treat_logic_state_for_run() {
+    treatDispensed = false;
+    lhTransitions = 0;
+    stopRequested_NoTreat = false;
+    waitForNextHigh_AfterTreat = false;
+    seenLowAfterTreat = false;
+
+    // Seed edge detector to current rotary state to avoid a fake edge
+    lastRotary = readPCF8574Pin(2);
+}
+
+// Optional: pass a pointer to a stop flag so schedule/training can abort instantly
+static MotorStopReason run_motor_with_treat_logic(
+    unsigned long timeout_ms,
+    volatile bool* external_stop_flag = nullptr
+) {
+    const unsigned long startTime = millis();
+
+    reset_treat_logic_state_for_run();
+
+    while ((millis() - startTime) < timeout_ms) {
+
+        if (external_stop_flag && *external_stop_flag) {
+            Serial.println("External stop flag set -> abort motor run.");
+            return STOP_EXTERNAL_REQUEST;
+        }
+
+        bool rawValue     = readPCF8574Pin(6); // P6 IR Receiver (HIGH=intact, LOW=broken)
+        bool rotarySwitch = readPCF8574Pin(2); // P2 Rotary Switch (HIGH=safe-to-stop / blocking position)
+        bool beamBroken   = !rawValue;
+
+        // --- 1) Treat detection ---
+        if (!treatDispensed && beamBroken) {
+            treatDispensed = true;
+
+            // Reset transition logic on dispense
+            lhTransitions = 0;
+            stopRequested_NoTreat = false;
+
+            // Stop at NEXT HIGH
+            waitForNextHigh_AfterTreat = true;
+
+            // If currently HIGH, we must see LOW then HIGH to count as "next HIGH"
+            seenLowAfterTreat = !rotarySwitch;
+
+            Serial.println("Beam broken! Treat dispensed.");
+        }
+
+        // --- 2) Rotary LOW->HIGH transition counting (ONLY if no treat yet) ---
+        if (!treatDispensed) {
+            if (!lastRotary && rotarySwitch) { // LOW -> HIGH edge
+                lhTransitions++;
+                Serial.print("Rotary LOW->HIGH transitions: ");
+                Serial.println(lhTransitions);
+
+                if (lhTransitions >= 3) {
+                    stopRequested_NoTreat = true; // stop at HIGH (now or next time it becomes HIGH)
+                }
+            }
+        }
+
+        // --- 3) Stop conditions ---
+        // A) Treat dispensed: stop at the NEXT high position
+        if (waitForNextHigh_AfterTreat) {
+            if (!seenLowAfterTreat) {
+                if (!rotarySwitch) seenLowAfterTreat = true; // wait for LOW at least once
+            } else {
+                if (rotarySwitch) {
+                    Serial.println("Stopping at NEXT HIGH after treat dispense.");
+                    return STOP_TREAT_NEXT_HIGH;
+                }
+            }
+        }
+
+        // B) No treat after 3 transitions: stop when rotary is HIGH
+        if (stopRequested_NoTreat && rotarySwitch) {
+            Serial.println("No treat after 3 LOW->HIGH transitions. Stopping at HIGH.");
+            return STOP_NO_TREAT_3_TRANSITIONS;
+        }
+
+        // --- 4) Optional jam detection (you already compute current; add threshold if desired) ---
+        int adcValue = analogRead(CURRENT_SENSOR_PIN);
+        float voltage = (adcValue / 4095.0f) * 4.0f;
+        float current = (voltage - ZERO_CURRENT_VOLTAGE) / SENSITIVITY;
+
+        // Example optional jam stop:
+        // if (current > JAM_THRESHOLD_AMPS) {
+        //     Serial.printf("JAM detected! current=%.2fA\n", current);
+        //     return STOP_JAM;
+        // }
+
+        lastRotary = rotarySwitch;
+
+        delay(5); // small yield; adjust as needed
+    }
+
+    Serial.println("Motor timeout reached.");
+    return STOP_TIMEOUT;
+}
 
 // Active-low LED helpers (place BEFORE usage)
 static inline void led_apply(bool on) {
@@ -257,66 +369,73 @@ extern "C" {
         }
     }
     
-    void schedule_dispense_treat() {
-        Serial.println("=== Schedule Treat Dispense ===");
+   void schedule_dispense_treat() {
+    Serial.println("=== Schedule Treat Dispense ===");
+
+    // Ensure everything is stopped before starting a new dispense
+    full_stop();
+
+    // First treat (index 0) dispenses immediately
+    if (current_treat_index == 0) {
+        Serial.println("First treat - dispensing immediately");
+
+        // Play sound first
+        play_treat_audio();
+
+        // Turn LED ON (active-low per your wiring)
+        setPCF8574Pin(4, false); // LED ON
+
+        // Start motor + IR
+        Motor_Start();
+        IR_Start();
+
+        const unsigned long MOTOR_TIMEOUT = 5000; // 5 seconds
+
+        // Run motor using SAME logic as manual dispense:
+        // - If beam breaks: stop at NEXT HIGH
+        // - If no beam after 3 LOW->HIGH transitions: stop at HIGH
+        // - Also allows user stop via schedule_stop_requested
+        MotorStopReason reason = run_motor_with_treat_logic(MOTOR_TIMEOUT, &schedule_stop_requested);
+
         // Stop motor and IR
-            full_stop();
+        full_stop();
 
-        // First treat (index 0) dispenses immediately
-        if (current_treat_index == 0) {
-            Serial.println("First treat - dispensing immediately");
-            
-            // Play treat sound first, then turn on LED
-            play_treat_audio();
-            
-            // Same dispense logic as manual treat
-            setPCF8574Pin(4, false); // LED ON
-            Motor_Start();
-            IR_Start();
-            
-            const unsigned long MOTOR_TIMEOUT = 5000; // 5 seconds
-            bool treatDispensed = false;
-            unsigned long startTime = millis();
-            
-            while (!treatDispensed && (millis() - startTime < MOTOR_TIMEOUT)) {
-                // Current monitoring and jam detection (same as manual)
-                int adcValue = analogRead(CURRENT_SENSOR_PIN);
-                float voltage = (adcValue / 4095.0) * 4.0;
-                float current = (voltage - ZERO_CURRENT_VOLTAGE) / SENSITIVITY;
+        Serial.print("Schedule first-treat stop reason: ");
+        Serial.println((int)reason);
 
-                delay(50);
-            }
-            
-            // Stop motor and IR
-            full_stop();
-            
-            // Play treat sound
-            play_treat_audio();
-            
-            // Keep LED ON for 2 seconds
-            delay(2000);
+        // If user hit stop during dispense, don't count it as dispensed
+        if (reason == STOP_EXTERNAL_REQUEST) {
+            Serial.println("Schedule stopped by user during dispense; not incrementing counters.");
             setPCF8574Pin(4, true); // LED OFF
-            
-            // Update counter
-            schedule_treats_dispensed++;
-            
-            // Update UI immediately after dispensing
-            update_schedule_3_ui();
-            
-            // Move to next treat
-            current_treat_index++;
-            
-            Serial.printf("First treat dispensed! Total: %d\n", schedule_treats_dispensed);
-        } else {
-            // Subsequent treats follow training state machine
-            Serial.printf("Treat %d - starting training sequence\n", current_treat_index + 1);
-            schedule_waiting_for_button = true;
-            schedule_train_state = 0; // Start with LED ON for 5s
-            schedule_state_start_time = millis();
-            schedule_led_blink_state = false;
-            schedule_last_blink = millis();
+            return;
         }
+
+        // Treat complete feedback
+        play_treat_audio();
+
+        // Keep LED ON for 2 seconds after stopping
+        delay(2000);
+        setPCF8574Pin(4, true); // LED OFF
+
+        // Update counter/UI
+        schedule_treats_dispensed++;
+        update_schedule_3_ui();
+
+        // Move to next treat
+        current_treat_index++;
+
+        Serial.printf("First treat completed! Total dispensed: %d\n", schedule_treats_dispensed);
+    } else {
+        // Subsequent treats follow training state machine (button-gated)
+        Serial.printf("Treat %d - starting training sequence\n", current_treat_index + 1);
+        schedule_waiting_for_button = true;
+        schedule_train_state = 0; // Start with LED ON for 5s
+        schedule_state_start_time = millis();
+        schedule_led_blink_state = false;
+        schedule_last_blink = millis();
     }
+}
+
     
     void schedule_timer_tick(lv_timer_t * timer) {
         if (!schedule_is_running || schedule_is_paused) {
@@ -444,46 +563,49 @@ extern "C" {
                     }
                     break;
                 
-                case 10: // Actually dispense the treat
-                    led_blink_mode = false;
-                    led_set_solid(false);
-                    
-                    // Dispense treat using same logic as first treat
-                    Serial.println("Dispensing scheduled treat");
-                    setPCF8574Pin(4, false); // LED ON
-                    Motor_Start();
-                    IR_Start();
-                    
-                    const unsigned long MOTOR_TIMEOUT = 5000;
-                    unsigned long startTime = millis();
-                    
-                    // Run motor for full 5 seconds with jam detection
-                    while ((millis() - startTime < MOTOR_TIMEOUT)) {
-                        int adcValue = analogRead(CURRENT_SENSOR_PIN);
-                        float voltage = (adcValue / 4095.0) * 4.0;
-                        float current = (voltage - ZERO_CURRENT_VOLTAGE) / SENSITIVITY;
-                        
+                    case 10: { // Actually dispense the treat
+                        led_blink_mode = false;
+                        led_set_solid(false);
 
-                        delay(50);
+                        Serial.println("Dispensing scheduled treat");
+                        setPCF8574Pin(4, false); // LED ON
+
+                        Motor_Start();
+                        IR_Start();
+
+                        const unsigned long MOTOR_TIMEOUT = 5000;
+
+                        MotorStopReason reason = run_motor_with_treat_logic(MOTOR_TIMEOUT, &schedule_stop_requested);
+
+                        full_stop();
+
+                        Serial.print("Schedule treat stop reason: ");
+                        Serial.println((int)reason);
+
+                        // If user hit stop during dispense, don't count it
+                        if (reason == STOP_EXTERNAL_REQUEST) {
+                            Serial.println("Schedule stopped by user during dispense; not incrementing counters.");
+                            setPCF8574Pin(4, true); // LED OFF
+                            schedule_waiting_for_button = false;
+                            schedule_train_state = 0;
+                            break;
+                        }
+
+                        play_treat_audio();
+                        delay(2000);
+                        setPCF8574Pin(4, true); // LED OFF
+
+                        schedule_treats_dispensed++;
+                        update_schedule_3_ui();
+                        current_treat_index++;
+
+                        schedule_waiting_for_button = false;
+                        schedule_train_state = 0;
+
+                        Serial.printf("Scheduled treat dispensed! Total: %d\n", schedule_treats_dispensed);
+                        break;
                     }
-                    
-                    full_stop();
-                    play_treat_audio();
-                    delay(2000);
-                    setPCF8574Pin(4, true); // LED OFF
-                    
-                    // Update counter and UI
-                    schedule_treats_dispensed++;
-                    update_schedule_3_ui();
-                    current_treat_index++;
-                    
-                    // Reset state machine
-                    schedule_waiting_for_button = false;
-                    schedule_train_state = 0;
-                    
-                    Serial.printf("Scheduled treat dispensed! Total: %d\n", schedule_treats_dispensed);
-                    break;
-            }
+
             return; // Don't continue with normal timer logic while in training mode
         }
         
@@ -539,6 +661,7 @@ extern "C" {
             }
         }
     }
+}
     
     void init_audio() {
         // Initialize DAC audio properly - use GPIO 26 for ESP32-2432S028R
@@ -764,15 +887,6 @@ static inline bool read_beam_P6() {
         Serial.println("Motor started (fixed 5s run) - case 10");
         break;
 
-    case 11: { // Motor running
-        unsigned long elapsed = now - state_start_time;
-        int adcValue = analogRead(CURRENT_SENSOR_PIN);
-        float voltage = (adcValue / 4095.0f) * 4.0f;
-        float current = (voltage - ZERO_CURRENT_VOLTAGE) / SENSITIVITY;
-
-        break;
-    }
-
     case 99: // Done
         full_stop();
         led_set_solid(false);
@@ -788,107 +902,30 @@ static inline bool read_beam_P6() {
     // Manual Treat Dispense Action
     void action_manual_dispense_treat(lv_event_t * e) {
         Serial.println("\n=== Manual Treat Dispense Started ===");
-        // Stop motor and IR
-        //full_stop();
-        // Play treat sound immediately when button is pressed
+
         play_treat_audio();
-        
+
         setPCF8574Pin(4, false); // LED ON
         delay(200);
+
         Motor_Start();
         IR_Start();
-        const unsigned long MOTOR_TIMEOUT = 5000; // 5 seconds
 
-        bool treatDispensed = false;
-        
-        unsigned long startTime = millis();
+        const unsigned long MOTOR_TIMEOUT = 5000;
 
-        // Reset attempt-scoped state (do this every Manual Treat attempt)
-        treatDispensed = false;
-        lhTransitions = 0;
-        stopRequested_NoTreat = false;
-        waitForNextHigh_AfterTreat = false;
-        seenLowAfterTreat = false;
+        MotorStopReason reason = run_motor_with_treat_logic(MOTOR_TIMEOUT, nullptr);
 
-        // Seed edge detector to current rotary state to avoid a fake edge on first iteration
-        lastRotary = readPCF8574Pin(2);
-
-        while ((millis() - startTime) < MOTOR_TIMEOUT) {
-
-            bool rawValue     = readPCF8574Pin(6); // P6 IR Receiver (HIGH=intact, LOW=broken)
-            bool rotarySwitch = readPCF8574Pin(2); // P2 Rotary Switch (HIGH=safe-to-stop / blocking position)
-            bool beamBroken = !rawValue;
-
-            // --- 1) Treat detection ---
-            if (!treatDispensed && beamBroken) {
-            treatDispensed = true;
-
-            // Reset transition logic on dispense
-            lhTransitions = 0;
-            stopRequested_NoTreat = false;
-
-            // Now stop at NEXT HIGH
-            waitForNextHigh_AfterTreat = true;
-
-            // If currently HIGH, we must see LOW then HIGH to count as "next HIGH"
-            seenLowAfterTreat = !rotarySwitch;
-
-            Serial.println("Beam broken! Treat dispensed.");
-            }
-
-            // --- 2) Rotary LOW->HIGH transition counting (ONLY if no treat yet) ---
-            if (!treatDispensed) {
-                if (!lastRotary && rotarySwitch) {          // LOW -> HIGH edge
-                lhTransitions++;
-                Serial.print("Rotary LOW->HIGH transitions: ");
-                Serial.println(lhTransitions);
-
-                if (lhTransitions >= 3) {
-                    stopRequested_NoTreat = true;           // stop at HIGH (now or next time it becomes HIGH)
-                }
-                }
-            }
-
-            // --- 3) Stop conditions ---
-            // A) Treat dispensed: stop at the NEXT high position
-            if (waitForNextHigh_AfterTreat) {
-                if (!seenLowAfterTreat) {
-                // We are waiting to see LOW at least once after dispense
-                if (!rotarySwitch) seenLowAfterTreat = true;
-                } else {
-                // Once we've seen LOW, the next HIGH is our stop point
-                if (rotarySwitch) {
-                    Serial.println("Stopping at NEXT HIGH after treat dispense.");
-                    break; // exit loop -> stop motor
-                }
-                }
-            }
-
-            // B) No treat after 3 transitions: stop when rotary is HIGH
-            if (stopRequested_NoTreat && rotarySwitch) {
-                Serial.println("No treat after 3 LOW->HIGH transitions. Stopping at HIGH.");
-                break; // exit loop -> stop motor
-            }
-
-            // --- 4) Optional: current monitoring (your existing code) ---
-            int adcValue = analogRead(CURRENT_SENSOR_PIN);
-            float voltage = (adcValue / 4095.0) * 4.0;
-            float current = (voltage - ZERO_CURRENT_VOLTAGE) / SENSITIVITY;
-
-            // Save state for edge detection next iteration
-            lastRotary = rotarySwitch;
-        }
-
-        // Stop motor and IR system
         full_stop();
 
-        // Keep LED ON for 2 seconds after stopping
+        Serial.print("Manual stop reason: ");
+        Serial.println((int)reason);
+
         delay(2000);
         setPCF8574Pin(4, true); // LED OFF
-        Serial.println("LED OFF after 2 seconds");
 
         Serial.println("=== Manual Treat Dispense Complete ===\n");
     }
+
     //************************************************** */
     void action_train_dispense_treat(lv_event_t * e) {
         // Stop motor and IR
