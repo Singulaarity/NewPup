@@ -1,23 +1,31 @@
 // actions.cpp (clean, compile-safe version)
-// Updates in this revision:
-// 1) Manual treat mode (screen button) sequence:
-//      - Beep 1s + LED ON
+//
+// Updates included:
+// 1) Manual treat mode sequence:
+//      - Beep 1s + LED ON (P4 active-low)
 //      - LED stays ON
 //      - Wait 5s
 //      - Beep 1s
-//      - Dispense treat
+//      - Dispense treat (motor + IR + stop logic)
+//      - full_stop() at end
 //
-// 2) Foot-switch training (20s window):
-//      - LED solid ON
+// 2) Foot-switch training (standalone / “anytime”):
+//      - 20s window
+//      - LED solid ON (P4)
 //      - 1s tone every 5s
-//      - Wait for foot switch (PCF P3) press -> dispense ONE treat
-//      - If 20s expires -> no treat
+//      - Wait for foot switch on P3 (active-low)
+//      - If pressed within window -> dispense ONE treat
+//      - If timeout -> no treat
 //      - Hardened against motor auto-start by forcing full_stop AFTER init + motor-off guard
 //
-// 3) Scheduled treat mode behavior (per your latest requirement):
-//      - Treat #1 uses the SAME sequence as manual treat dispense
-//      - Treats #2..N use a training-like sequence requiring FOOT SWITCH activation
-//        (20s window; if not pressed -> skip treat, continue schedule)
+// 3) Scheduled treat mode behavior:
+//      - Treat #1 follows the manual treat sequence (beep+LED, wait 5s, beep, dispense)
+//      - Treat #2..N require foot-switch activation (20s window). If not pressed -> skip treat.
+//
+// 4) NEW: IR remote trigger on PCF P7 (active-low):
+//      - Debounced edge on P7 starts the standalone foot-switch training window at ANY time
+//      - Implemented via a small LVGL timer polling P7.
+//
 
 #include <Arduino.h>
 #include <stdlib.h>
@@ -72,7 +80,7 @@ static inline bool every_30s(unsigned long now_ms) {
 }
 
 // ---------------------------
-// State variables (training)
+// State variables (button training)
 // ---------------------------
 volatile bool train_dispense_stop_requested = false;
 static int  train_dispense_state = 0;
@@ -92,7 +100,7 @@ static unsigned long foot_train_last_tone_ms = 0;
 
 // Foot switch is on PCF P3 (pressed = LOW)
 static inline bool footswitch_pressed_debounced(unsigned long now_ms) {
-    bool raw = !readPCF8574Pin(3); // pressed = LOW => !HIGH
+    bool raw = !readPCF8574Pin(3); // active-low => pressed when LOW
     static bool prev = false;
     static unsigned long t = 0;
     if (raw != prev) { prev = raw; t = now_ms; }
@@ -102,8 +110,8 @@ static inline bool footswitch_pressed_debounced(unsigned long now_ms) {
 // ---------------------------
 // Schedule state variables
 // ---------------------------
-static bool schedule_waiting_for_button = false; // reused as "waiting for foot switch"
-static unsigned long schedule_state_start_time = 0;
+static bool schedule_waiting_for_footswitch = false;
+static unsigned long schedule_wait_start_ms = 0;
 static unsigned long schedule_last_tone_ms = 0;
 
 volatile bool schedule_stop_requested = false;
@@ -120,15 +128,6 @@ void* schedule_timer = NULL;
 static unsigned long schedule_start_time = 0;
 static unsigned long schedule_pause_time = 0;
 static int schedule_last_displayed_minutes = -9999;
-
-// =====================================================
-// Scheduled Mode Behavior
-// =====================================================
-// REQUIRED by your spec now:
-// - Treat #1 = manual sequence
-// - Treat #2..N = foot-switch required sequence
-// =====================================================
-#define SCHEDULE_REQUIRE_FOOTSWITCH  1
 
 // Schedule timing arrays
 static int scheduled_times[96]; // Max 8 hours * 12 treats = 96 treats
@@ -291,6 +290,9 @@ void Motor_Start();
 void IR_Start();
 void IR_Stop();
 
+// ---------------------------
+// Button (PIN_BUTTON) helpers
+// ---------------------------
 static inline bool button_pressed_debounced(unsigned long now_ms) {
     bool raw = !readPCF8574Pin(PIN_BUTTON); // pressed = LOW
     static bool prev = false;
@@ -307,22 +309,100 @@ static inline bool button_edge_pressed() {
     return edge;
 }
 
+// =====================================================
+// IR Remote (P7 active-low) -> start foot-switch training ANYTIME
+// =====================================================
+static lv_timer_t* remote_poll_timer = NULL;
+
+static inline bool remote_p7_edge_pressed(unsigned long now_ms) {
+    bool raw = !readPCF8574Pin(7); // active-low => pressed when LOW
+    static bool last_raw = false;
+    static bool last_stable = false;
+    static unsigned long t_change = 0;
+
+    if (raw != last_raw) {
+        last_raw = raw;
+        t_change = now_ms;
+    }
+
+    if ((now_ms - t_change) > 30) {
+        bool prev = last_stable;
+        last_stable = raw;
+        return (last_stable && !prev); // edge into pressed state
+    }
+    return false;
+}
+
+static void footswitch_train_tick(lv_timer_t* timer); // forward
+
+static void start_footswitch_training_window() {
+    // Don’t restart if already running
+    if (foot_train_active || foot_train_timer) return;
+
+    Serial.println("Foot-switch training window STARTED (remote/UI)");
+
+    // IMPORTANT: init can glitch outputs -> init FIRST, then full_stop AFTER
+    initPCF8574Pins();
+    delay(50);
+
+    // Force known-safe outputs AFTER init (prevents motor auto-start)
+    full_stop();
+
+    // Ensure P3 + P7 behave as inputs (PCF quasi-bidirectional): write HIGH to read them
+    setPCF8574Pin(3, false);
+    setPCF8574Pin(7, false);
+
+    foot_train_active = true;
+    foot_train_start_ms = millis();
+    foot_train_last_tone_ms = foot_train_start_ms - 5000UL; // immediate tone
+
+    // LED ON (P4 active-low)
+    setPCF8574Pin(4, false);
+
+    // Tick fast enough to catch switch presses + timing
+    foot_train_timer = lv_timer_create(footswitch_train_tick, 50, NULL);
+}
+
+static void remote_poll_tick(lv_timer_t* t) {
+    (void)t;
+    unsigned long now = millis();
+    if (remote_p7_edge_pressed(now)) {
+        Serial.println("IR Remote (P7) pressed -> start training");
+        start_footswitch_training_window();
+    }
+}
+
+static void ensure_remote_poll_timer_running() {
+    if (!remote_poll_timer) {
+        // Make sure P7 is released high so reads work reliably
+        setPCF8574Pin(7, false);
+        remote_poll_timer = lv_timer_create(remote_poll_tick, 25, NULL);
+        Serial.println("Remote poll timer started (P7 training trigger)");
+    }
+}
+
 // ---------------------------
 // UI updater
 // ---------------------------
 void update_schedule_3_ui() {
+    // Keep remote trigger alive (safe to call repeatedly)
+    ensure_remote_poll_timer_running();
+
+    // Treats per hour
     if (objects.treats_per_hour) {
         char treats_str[10];
         snprintf(treats_str, sizeof(treats_str), "%d", selected_treats_number);
         lv_label_set_text(objects.treats_per_hour, treats_str);
     }
 
+    // Treats dispensed
     if (objects.treats_dispensed) {
         char dispensed_str[10];
         snprintf(dispensed_str, sizeof(dispensed_str), "%d", schedule_treats_dispensed);
         lv_label_set_text(objects.treats_dispensed, dispensed_str);
     }
 
+    // Time left HH:MM
     if (objects.schedule_time_left) {
         char time_str[10];
         if (schedule_is_running) {
@@ -421,25 +501,24 @@ void generate_schedule_times() {
 }
 
 // =====================================================
-// Shared dispense helpers for schedule
+// Scheduled treat helpers
 // =====================================================
 
-// Treat #1 schedule behavior = manual sequence
+// Treat #1: manual sequence, immediate
 static bool schedule_dispense_manual_sequence_now(volatile bool* stop_flag) {
-    // Return true if counters advanced. False if aborted by external stop during motor run.
     Serial.println("Schedule treat #1: manual-sequence dispense");
 
-    // 1) Beep + LED ON
+    // Beep + LED ON
     audio_play_tone_1s();
     setPCF8574Pin(4, false); // LED ON
 
-    // 2) Lights stay on for 5 seconds
+    // Wait 5 seconds (LED stays ON)
     delay(5000);
 
-    // 3) Beep again
+    // Beep again
     audio_play_tone_1s();
 
-    // 4) Dispense (motor + IR + shared stop logic)
+    // Dispense
     Motor_Start();
     IR_Start();
 
@@ -448,7 +527,7 @@ static bool schedule_dispense_manual_sequence_now(volatile bool* stop_flag) {
 
     full_stop();
 
-    Serial.print("Schedule manual-seq stop reason: ");
+    Serial.print("Schedule #1 stop reason: ");
     Serial.println((int)reason);
 
     if (reason == STOP_EXTERNAL_REQUEST) {
@@ -462,16 +541,11 @@ static bool schedule_dispense_manual_sequence_now(volatile bool* stop_flag) {
     return true;
 }
 
-// Treat #N (N>=2) schedule behavior = foot-switch required window (handled in timer tick)
-// When foot switch is pressed, we call this to actually dispense:
+// Treat #2..N: foot-switch pressed -> dispense NOW (no 5s delay)
 static bool schedule_dispense_now_on_footswitch(volatile bool* stop_flag) {
-    // Return true if counters advanced. False if aborted by external stop during motor run.
-    Serial.println("Schedule foot-switch dispense NOW");
+    Serial.println("Schedule: foot-switch dispense NOW");
 
     full_stop();
-
-    // Optional "confirmation" tone right at dispense start
-    // audio_play_tone_1s();
 
     setPCF8574Pin(4, false); // LED ON
     Motor_Start();
@@ -496,34 +570,30 @@ static bool schedule_dispense_now_on_footswitch(volatile bool* stop_flag) {
     return true;
 }
 
-// ---------------------------
-// Dispense entrypoint used by schedule
-// ---------------------------
+// Entry point called when schedule time is reached
 void schedule_dispense_treat() {
     Serial.println("=== Schedule Treat Trigger ===");
 
-#if SCHEDULE_REQUIRE_FOOTSWITCH
     if (current_treat_index == 0) {
-        // Treat #1 uses manual sequence immediately
+        // Treat #1: manual sequence immediately
         (void)schedule_dispense_manual_sequence_now(&schedule_stop_requested);
     } else {
-        // Treat #2..N require foot switch within a 20s window
-        schedule_waiting_for_button = true;
-        schedule_state_start_time = millis();
-        schedule_last_tone_ms = schedule_state_start_time - 5000UL; // force immediate tone
+        // Treat #2..N: open 20s foot-switch window
+        schedule_waiting_for_footswitch = true;
+        schedule_wait_start_ms = millis();
+        schedule_last_tone_ms  = schedule_wait_start_ms - 5000UL; // immediate tone
         Serial.printf("Schedule treat %d: waiting for FOOT SWITCH (20s)\n", current_treat_index + 1);
     }
-#else
-    // If you ever revert behavior, you can implement pure auto here
-    (void)schedule_dispense_manual_sequence_now(&schedule_stop_requested);
-#endif
 }
 
 // ---------------------------
-// Schedule timer tick (CLEAN + re-entry safe)
+// Schedule timer tick
 // ---------------------------
 void schedule_timer_tick(lv_timer_t * timer) {
     (void)timer;
+
+    // Keep remote trigger alive (safe to call repeatedly)
+    ensure_remote_poll_timer_running();
 
     if (!schedule_is_running || schedule_is_paused) return;
 
@@ -532,7 +602,7 @@ void schedule_timer_tick(lv_timer_t * timer) {
     // Stop request
     if (schedule_stop_requested) {
         schedule_is_running = false;
-        schedule_waiting_for_button = false;
+        schedule_waiting_for_footswitch = false;
         schedule_stop_requested = false;
 
         full_stop();
@@ -543,6 +613,45 @@ void schedule_timer_tick(lv_timer_t * timer) {
         }
 
         Serial.println("=== Schedule STOPPED by user ===");
+        return;
+    }
+
+    // If we are in the schedule foot-switch wait window (#2..N)
+    if (schedule_waiting_for_footswitch) {
+        // GUARD: keep motor OFF while waiting
+        setPCF8574Pin(0, false);
+        setPCF8574Pin(1, false);
+
+        // LED solid ON during wait
+        setPCF8574Pin(4, false);
+
+        // Tone every 5 seconds (1 second tone)
+        if (now - schedule_last_tone_ms >= 5000UL) {
+            schedule_last_tone_ms = now;
+            audio_play_tone_1s();
+        }
+
+        // Timeout window: 20 seconds -> skip treat
+        if (now - schedule_wait_start_ms >= 20000UL) {
+            Serial.printf("Schedule treat %d: foot-switch TIMEOUT -> skipping\n", current_treat_index + 1);
+            schedule_waiting_for_footswitch = false;
+            setPCF8574Pin(4, true); // LED OFF
+            current_treat_index++;  // skip this treat
+            return;
+        }
+
+        // Foot switch pressed -> dispense ONE treat
+        if (footswitch_pressed_debounced(now)) {
+            Serial.printf("Schedule treat %d: foot-switch PRESSED -> dispensing\n", current_treat_index + 1);
+
+            schedule_waiting_for_footswitch = false;
+            (void)schedule_dispense_now_on_footswitch(&schedule_stop_requested);
+
+            setPCF8574Pin(4, true); // LED OFF after dispense
+            return;
+        }
+
+        // Still waiting
         return;
     }
 
@@ -559,52 +668,6 @@ void schedule_timer_tick(lv_timer_t * timer) {
         schedule_last_displayed_minutes = schedule_remaining_minutes;
         update_schedule_3_ui();
     }
-
-#if SCHEDULE_REQUIRE_FOOTSWITCH
-    // If we are currently waiting for foot switch for a scheduled treat (#2..N)
-    if (schedule_waiting_for_button) {
-        // GUARD: keep motor outputs OFF during wait window (prevents any glitches)
-        setPCF8574Pin(0, false);
-        setPCF8574Pin(1, false);
-
-        // LED solid ON during wait window
-        setPCF8574Pin(4, false);
-
-        // Tone every 5 seconds (1 second tone)
-        if (now - schedule_last_tone_ms >= 5000UL) {
-            schedule_last_tone_ms = now;
-            audio_play_tone_1s();
-        }
-
-        // Timeout window: 20 seconds, then skip treat
-        if (now - schedule_state_start_time >= 20000UL) {
-            Serial.printf("Schedule treat %d: foot-switch TIMEOUT -> skipping\n", current_treat_index + 1);
-            schedule_waiting_for_button = false;
-            setPCF8574Pin(4, true); // LED OFF
-
-            // Skip this treat and continue schedule
-            current_treat_index++;
-            return;
-        }
-
-        // Foot switch pressed -> dispense ONE treat
-        if (footswitch_pressed_debounced(now)) {
-            Serial.printf("Schedule treat %d: foot-switch PRESSED -> dispensing\n", current_treat_index + 1);
-
-            schedule_waiting_for_button = false;
-
-            bool advanced = schedule_dispense_now_on_footswitch(&schedule_stop_requested);
-            (void)advanced;
-
-            // Ensure LED off after dispense
-            setPCF8574Pin(4, true);
-            return;
-        }
-
-        // Still waiting
-        return;
-    }
-#endif
 
     // Completion check
     if (schedule_remaining_minutes <= 0 || current_treat_index >= total_scheduled_treats) {
@@ -629,7 +692,6 @@ void schedule_timer_tick(lv_timer_t * timer) {
     if (current_treat_index < total_scheduled_treats) {
         int next_treat_time = scheduled_times[current_treat_index];
 
-        // Debug (optional)
         if (schedule_is_running && current_treat_index == 1 && every_30s(now)) {
             Serial.printf("Checking treat 2: current_time=%d min, scheduled=%d min\n",
                           elapsed_minutes, next_treat_time);
@@ -707,6 +769,9 @@ void IR_Stop() {
 static void footswitch_train_tick(lv_timer_t* timer) {
     (void)timer;
 
+    // Keep remote trigger alive
+    ensure_remote_poll_timer_running();
+
     const unsigned long now = millis();
 
     if (!foot_train_active) {
@@ -773,9 +838,11 @@ static void footswitch_train_tick(lv_timer_t* timer) {
 }
 
 // ---------------------------
-// Train dispense state machine (button training) (unchanged)
+// Button training state machine (PIN_BUTTON) (unchanged behavior)
 // ---------------------------
 void train_dispense_tick(lv_timer_t * timer) {
+    ensure_remote_poll_timer_running();
+
     if (train_dispense_stop_requested) {
         full_stop();
         led_set_solid(false);
@@ -896,23 +963,25 @@ void train_dispense_tick(lv_timer_t * timer) {
 // Actions (LVGL events)
 // ---------------------------
 
-// Manual treat behavior per your request:
+// Manual treat behavior:
 // Press button -> beep+LED ON -> wait 5s (LED stays on) -> beep -> dispense
 void action_manual_dispense_treat(lv_event_t * e) {
     (void)e;
+    ensure_remote_poll_timer_running();
+
     Serial.println("\n=== Manual Treat Dispense (timed) Started ===");
 
-    // 1) Beep + LED ON
+    // Beep + LED ON
     audio_play_tone_1s();
     setPCF8574Pin(4, false); // LED ON
 
-    // 2) Wait 5 seconds (LED stays ON)
+    // Wait 5 seconds (LED stays ON)
     delay(5000);
 
-    // 3) Beep
+    // Beep
     audio_play_tone_1s();
 
-    // 4) Dispense treat
+    // Dispense treat
     Motor_Start();
     IR_Start();
 
@@ -929,6 +998,8 @@ void action_manual_dispense_treat(lv_event_t * e) {
 
 void action_train_dispense_treat(lv_event_t * e) {
     (void)e;
+    ensure_remote_poll_timer_running();
+
     full_stop();
     initPCF8574Pins();
     delay(100);
@@ -942,35 +1013,17 @@ void action_train_dispense_treat(lv_event_t * e) {
     lv_timer_create(train_dispense_tick, 50, NULL);
 }
 
-// Standalone foot-switch training action (20s window)
+// Standalone foot-switch training action (20s window) - can also be triggered by P7 remote
 void action_train_footswitch_dispense_start(lv_event_t* e) {
     (void)e;
-
-    Serial.println("=== Foot-switch Training START (20s window) ===");
-
-    if (foot_train_timer) {
-        lv_timer_del(foot_train_timer);
-        foot_train_timer = NULL;
-    }
-
-    // IMPORTANT: init can glitch outputs -> do init FIRST, then full_stop AFTER
-    initPCF8574Pins();
-    delay(50);
-    full_stop();
-
-    // Ensure P3 behaves as input (PCF quasi-bidirectional): write HIGH to read it
-    setPCF8574Pin(3, false);
-
-    foot_train_active = true;
-    foot_train_start_ms = millis();
-    foot_train_last_tone_ms = foot_train_start_ms - 5000UL; // immediate tone
-
-    setPCF8574Pin(4, false); // LED ON
-    foot_train_timer = lv_timer_create(footswitch_train_tick, 50, NULL);
+    ensure_remote_poll_timer_running();
+    start_footswitch_training_window();
 }
 
 void action_train_dispense_stop(lv_event_t * e) {
     (void)e;
+    ensure_remote_poll_timer_running();
+
     Serial.println("=== Train Dispense STOP requested ===");
     train_dispense_stop_requested = true;
     full_stop();
@@ -978,6 +1031,8 @@ void action_train_dispense_stop(lv_event_t * e) {
 
 void action_schedule_add_treat_num(lv_event_t * e) {
     (void)e;
+    ensure_remote_poll_timer_running();
+
     int idx = lv_roller_get_selected(objects.schedule_1_treatsnumber);
     selected_treats_number = idx + 1;
     Serial.print("Treats to dispense selected: ");
@@ -987,6 +1042,8 @@ void action_schedule_add_treat_num(lv_event_t * e) {
 
 void action_schedule_add_hours(lv_event_t * e) {
     (void)e;
+    ensure_remote_poll_timer_running();
+
     int idx = lv_roller_get_selected(objects.schedule_2_hours_to_dispense);
     selected_hours_to_dispense = idx + 1;
     Serial.print("Hours to dispense selected: ");
@@ -996,12 +1053,16 @@ void action_schedule_add_hours(lv_event_t * e) {
 
 void action_schedule_2_next(lv_event_t * e) {
     (void)e;
+    ensure_remote_poll_timer_running();
+
     Serial.println("Transitioning to Schedule 3 screen");
     Serial.printf("Current values: treats=%d, hours=%d\n", selected_treats_number, selected_hours_to_dispense);
 }
 
 void action_scheduletreatdispensestart(lv_event_t * e) {
     (void)e;
+    ensure_remote_poll_timer_running();
+
     Serial.println("=== Schedule Dispense START ===");
     full_stop();
 
@@ -1011,6 +1072,7 @@ void action_scheduletreatdispensestart(lv_event_t * e) {
         schedule_treats_dispensed = 0;
         schedule_remaining_minutes = selected_hours_to_dispense * 60;
         current_treat_index = 0;
+        schedule_waiting_for_footswitch = false;
 
         Serial.printf("Initializing schedule: %d hours = %d minutes\n",
                       selected_hours_to_dispense, schedule_remaining_minutes);
@@ -1049,6 +1111,8 @@ void action_scheduletreatdispensestart(lv_event_t * e) {
 
 void action_scheduletreatdispensepause(lv_event_t * e) {
     (void)e;
+    ensure_remote_poll_timer_running();
+
     if (schedule_is_running && !schedule_is_paused) {
         schedule_is_paused = true;
         schedule_pause_time = millis();
@@ -1061,6 +1125,8 @@ void action_scheduletreatdispensepause(lv_event_t * e) {
 
 void action_scheduletreatdispensestop(lv_event_t * e) {
     (void)e;
+    ensure_remote_poll_timer_running();
+
     Serial.println("=== Schedule Dispense STOPPED ===");
 
     schedule_stop_requested = true;
@@ -1071,7 +1137,7 @@ void action_scheduletreatdispensestop(lv_event_t * e) {
     schedule_remaining_minutes = 0;
     current_treat_index = 0;
 
-    schedule_waiting_for_button = false;
+    schedule_waiting_for_footswitch = false;
 
     if (schedule_timer != NULL) {
         lv_timer_del((lv_timer_t*)schedule_timer);
