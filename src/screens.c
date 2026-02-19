@@ -777,7 +777,7 @@ void create_screen_schedule_1() {
             objects.obj0 = obj;
             lv_obj_set_pos(obj, 28, 54);
             lv_obj_set_size(obj, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
-            lv_label_set_text(obj, "Treats To Dispense:");
+            lv_label_set_text(obj, "Treats Per Hour To Dispense:");
             lv_obj_set_style_text_color(obj, lv_color_hex(0xffffffff), LV_PART_MAIN | LV_STATE_DEFAULT);
         }
         {

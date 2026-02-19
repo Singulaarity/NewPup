@@ -1,5 +1,4 @@
 // actions.cpp (clean, compile-safe version)
-// FIXES INCLUDED:
 // - Auto-schedule mode now actually dispenses ALL scheduled treats (not just treat #1)
 // - schedule_timer_tick uses a re-entry guard + sets last_dispense_time BEFORE calling dispense (prevents “treat #2 never advances”)
 // - “Checking treat …” Serial print ONLY for treat #2 (index 1) AND only when schedule is running, rate-limited to 30s
