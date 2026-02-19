@@ -19,6 +19,7 @@
 #include "pcf8574_control.h"
 #include <Wire.h>
 #include <IRremoteESP8266.h>
+#include "audio_utils.h"
 
 // ---- Restore / fallback definitions (only used if not already provided elsewhere) ----
 #ifndef AUDIO_DAC_CHANNEL
@@ -257,7 +258,7 @@ extern "C" {
 
 // Forward declarations
 void init_audio();
-void play_treat_audio();
+// void play_treat_audio();
 void full_stop();
 void update_schedule_3_ui();
 
@@ -426,7 +427,8 @@ static bool schedule_dispense_now(volatile bool* stop_flag) {
 
     full_stop();
 
-    play_treat_audio();
+    //play_treat_audio();
+    audio_play_tone_1s();
 
     setPCF8574Pin(4, false); // LED ON
     Motor_Start();
@@ -446,8 +448,9 @@ static bool schedule_dispense_now(volatile bool* stop_flag) {
         return false;
     }
 
-    play_treat_audio();
-    delay(2000);
+    //play_treat_audio();
+    audio_play_tone_1s();
+    //delay(2000);
     setPCF8574Pin(4, true); // LED OFF
 
     schedule_treats_dispensed++;
@@ -532,7 +535,7 @@ void schedule_timer_tick(lv_timer_t * timer) {
             case 0: { // LED ON for 5s
                 led_set_solid(true);
                 static bool audio0 = false;
-                if (!audio0) { play_treat_audio(); audio0 = true; }
+                if (!audio0) { audio_play_tone_1s(); audio0 = true; }
 
                 if (start_pressed) {
                     schedule_train_state = 10;
@@ -565,7 +568,7 @@ void schedule_timer_tick(lv_timer_t * timer) {
             case 2: { // LED ON 5s
                 led_set_solid(true);
                 static bool audio2 = false;
-                if (!audio2) { play_treat_audio(); audio2 = true; }
+                if (!audio2) { audio_play_tone_1s(); audio2 = true; }
 
                 if (start_pressed) {
                     schedule_train_state = 10;
@@ -586,7 +589,7 @@ void schedule_timer_tick(lv_timer_t * timer) {
 
             case 3: { // blink 5s
                 static bool audiob = false;
-                if (!audiob) { play_treat_audio(); audiob = true; }
+                if (!audiob) { audio_play_tone_1s(); audiob = true; }
 
                 if (start_pressed) {
                     schedule_train_state = 10;
@@ -689,31 +692,6 @@ void init_audio() {
     Serial.println("DAC audio initialized on GPIO 26 (DAC_CHANNEL_2)");
 }
 
-void play_treat_audio() {
-    Serial.println("Playing simple bell audio");
-
-    for (int i = 0; i < 100; i++) {
-        dac_output_voltage(DAC_CHANNEL_2, 200);
-        delayMicroseconds(500);
-        dac_output_voltage(DAC_CHANNEL_2, 0);
-        delayMicroseconds(500);
-    }
-
-    delay(50);
-
-    for (int vol = 150; vol > 0; vol -= 30) {
-        for (int i = 0; i < 20; i++) {
-            dac_output_voltage(DAC_CHANNEL_2, vol);
-            delayMicroseconds(500);
-            dac_output_voltage(DAC_CHANNEL_2, 0);
-            delayMicroseconds(500);
-        }
-    }
-
-    dac_output_voltage(DAC_CHANNEL_2, 0);
-    Serial.println("Simple bell audio complete");
-}
-
 // ---------------------------
 // Motor/IR control
 // ---------------------------
@@ -777,7 +755,7 @@ void train_dispense_tick(lv_timer_t * timer) {
         case 0: { // LED ON 5s
             led_set_solid(true);
             static bool audio0 = false;
-            if (!audio0) { play_treat_audio(); audio0 = true; }
+            if (!audio0) { audio_play_tone_1s(); audio0 = true; }
 
             if (edge_pressed) {
                 train_dispense_state = 10;
@@ -807,7 +785,7 @@ void train_dispense_tick(lv_timer_t * timer) {
         case 2: { // LED ON 5s
             led_set_solid(true);
             static bool audio2 = false;
-            if (!audio2) { play_treat_audio(); audio2 = true; }
+            if (!audio2) { audio_play_tone_1s(); audio2 = true; }
 
             if (edge_pressed) {
                 train_dispense_state = 10;
@@ -826,7 +804,7 @@ void train_dispense_tick(lv_timer_t * timer) {
 
         case 3: { // Blink 5s
             static bool audiob = false;
-            if (!audiob) { play_treat_audio(); audiob = true; }
+            if (!audiob) { audio_play_tone_1s(); audiob = true; }
 
             if (edge_pressed) {
                 train_dispense_state = 10;
@@ -882,7 +860,8 @@ void action_manual_dispense_treat(lv_event_t * e) {
     (void)e;
     Serial.println("\n=== Manual Treat Dispense Started ===");
 
-    play_treat_audio();
+    //play_treat_audio();
+    audio_play_tone_1s();
     setPCF8574Pin(4, false); // LED ON
     delay(200);
 
@@ -897,7 +876,7 @@ void action_manual_dispense_treat(lv_event_t * e) {
     Serial.print("Manual stop reason: ");
     Serial.println((int)reason);
 
-    delay(2000);
+    //delay(2000);
     setPCF8574Pin(4, true); // LED OFF
 
     Serial.println("=== Manual Treat Dispense Complete ===\n");
