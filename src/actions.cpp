@@ -1,11 +1,23 @@
 // actions.cpp (clean, compile-safe version)
-// - Auto-schedule mode now actually dispenses ALL scheduled treats (not just treat #1)
-// - schedule_timer_tick uses a re-entry guard + sets last_dispense_time BEFORE calling dispense (prevents “treat #2 never advances”)
-// - “Checking treat …” Serial print ONLY for treat #2 (index 1) AND only when schedule is running, rate-limited to 30s
-// - General “debug/status” Serial output rate-limited to 30s (event logs still print immediately)
-// - Schedule generator matches: odd treats reliable (evenly spaced), even treats random anywhere in hour
-// - Schedule UI "Time Left" updates HH:MM once per minute, and is forced to update immediately on Start
-// - schedule_timer_tick cleaned (no duplicated blocks / no duplicate statics)
+// Updates in this revision:
+// 1) Manual treat mode (screen button) sequence:
+//      - Beep 1s + LED ON
+//      - LED stays ON
+//      - Wait 5s
+//      - Beep 1s
+//      - Dispense treat
+//
+// 2) Foot-switch training (20s window):
+//      - LED solid ON
+//      - 1s tone every 5s
+//      - Wait for foot switch (PCF P3) press -> dispense ONE treat
+//      - If 20s expires -> no treat
+//      - Hardened against motor auto-start by forcing full_stop AFTER init + motor-off guard
+//
+// 3) Scheduled treat mode behavior (per your latest requirement):
+//      - Treat #1 uses the SAME sequence as manual treat dispense
+//      - Treats #2..N use a training-like sequence requiring FOOT SWITCH activation
+//        (20s window; if not pressed -> skip treat, continue schedule)
 
 #include <Arduino.h>
 #include <stdlib.h>
@@ -71,13 +83,28 @@ static bool led_blink_state = false;
 static unsigned long last_blink = 0;
 
 // ---------------------------
+// Foot-switch training (standalone action)
+// ---------------------------
+static lv_timer_t* foot_train_timer = NULL;
+static bool foot_train_active = false;
+static unsigned long foot_train_start_ms = 0;
+static unsigned long foot_train_last_tone_ms = 0;
+
+// Foot switch is on PCF P3 (pressed = LOW)
+static inline bool footswitch_pressed_debounced(unsigned long now_ms) {
+    bool raw = !readPCF8574Pin(3); // pressed = LOW => !HIGH
+    static bool prev = false;
+    static unsigned long t = 0;
+    if (raw != prev) { prev = raw; t = now_ms; }
+    return raw && (now_ms - t > 30);
+}
+
+// ---------------------------
 // Schedule state variables
 // ---------------------------
-static bool schedule_waiting_for_button = false;
-static int schedule_train_state = 0;
+static bool schedule_waiting_for_button = false; // reused as "waiting for foot switch"
 static unsigned long schedule_state_start_time = 0;
-static bool schedule_led_blink_state = false;
-static unsigned long schedule_last_blink = 0;
+static unsigned long schedule_last_tone_ms = 0;
 
 volatile bool schedule_stop_requested = false;
 
@@ -97,10 +124,11 @@ static int schedule_last_displayed_minutes = -9999;
 // =====================================================
 // Scheduled Mode Behavior
 // =====================================================
-// 1 = scheduled treats REQUIRE button press (training-style)
-// 0 = scheduled treats dispense automatically (no button)
+// REQUIRED by your spec now:
+// - Treat #1 = manual sequence
+// - Treat #2..N = foot-switch required sequence
 // =====================================================
-#define SCHEDULE_REQUIRE_BUTTON  0
+#define SCHEDULE_REQUIRE_FOOTSWITCH  1
 
 // Schedule timing arrays
 static int scheduled_times[96]; // Max 8 hours * 12 treats = 96 treats
@@ -182,7 +210,6 @@ static MotorStopReason run_motor_with_treat_logic(unsigned long timeout_ms,
         if (!treatDispensed) {
             if (!lastRotary && rotarySwitch) { // LOW -> HIGH edge
                 lhTransitions++;
-                // (Keep this immediate; it's useful when diagnosing mechanical behavior)
                 Serial.print("Rotary LOW->HIGH transitions: ");
                 Serial.println(lhTransitions);
 
@@ -257,7 +284,6 @@ extern "C" {
 
 // Forward declarations
 void init_audio();
-// void play_treat_audio();
 void full_stop();
 void update_schedule_3_ui();
 
@@ -285,21 +311,18 @@ static inline bool button_edge_pressed() {
 // UI updater
 // ---------------------------
 void update_schedule_3_ui() {
-    // Treats per hour
     if (objects.treats_per_hour) {
         char treats_str[10];
         snprintf(treats_str, sizeof(treats_str), "%d", selected_treats_number);
         lv_label_set_text(objects.treats_per_hour, treats_str);
     }
 
-    // Treats dispensed
     if (objects.treats_dispensed) {
         char dispensed_str[10];
         snprintf(dispensed_str, sizeof(dispensed_str), "%d", schedule_treats_dispensed);
         lv_label_set_text(objects.treats_dispensed, dispensed_str);
     }
 
-    // Time left HH:MM
     if (objects.schedule_time_left) {
         char time_str[10];
         if (schedule_is_running) {
@@ -312,7 +335,6 @@ void update_schedule_3_ui() {
         lv_label_set_text(objects.schedule_time_left, time_str);
     }
 
-    // Rate-limit this status print (keep UI updating regardless)
     unsigned long now = millis();
     if (every_30s(now)) {
         Serial.printf("Updated Schedule UI: treats/hr=%d, dispensed=%d, hours=%d, remaining_min=%d\n",
@@ -323,26 +345,6 @@ void update_schedule_3_ui() {
 // ---------------------------
 // Schedule generation
 // ---------------------------
-/**
- * Schedule generation rules:
- *
- * - Scheduling begins immediately after the user presses Start.
- *   The first treat is dispensed right away (t ≈ 0–1 min).
- *
- * - Minimum treats per hour is 2.
- *
- * - Treat indexing is 1-based within each hour:
- *     Odd-numbered treats (1, 3, 5, ...) are RELIABLE treats.
- *     Even-numbered treats (2, 4, 6, ...) are RANDOM treats.
- *
- * - Reliable treats are evenly spaced across the hour.
- *   Example (5 treats/hour): Treats 1, 3, 5 at 0, 20, 40 minutes.
- *
- * - Random treats may occur ANY time within the hour (0–59 min),
- *   independent of reliable treat timing.
- *
- * - Scheduled times are stored in minutes-from-start and sorted.
- */
 void generate_schedule_times() {
     total_scheduled_treats = 0;
     current_treat_index = 0;
@@ -356,7 +358,7 @@ void generate_schedule_times() {
     int reliable_per_hour = (treats_per_hour + 1) / 2; // ceil(N/2)
     int random_per_hour   = treats_per_hour / 2;       // floor(N/2)
 
-    int spacing = 60 / reliable_per_hour;              // integer minutes
+    int spacing = 60 / reliable_per_hour;
 
     for (int hour = 0; hour < total_hours; hour++) {
         int hour_offset = hour * 60;
@@ -382,7 +384,7 @@ void generate_schedule_times() {
                     int existing = scheduled_times[j];
                     if (existing >= hour_offset && existing < hour_offset + 60) {
                         int existing_min = existing - hour_offset;
-                        if (abs(existing_min - t) < 1) { // exact collision
+                        if (abs(existing_min - t) < 1) {
                             valid = false;
                             break;
                         }
@@ -418,69 +420,102 @@ void generate_schedule_times() {
     }
 }
 
-// ---------------------------
-// Dispense NOW helper (used by auto-schedule mode)
-// ---------------------------
-static bool schedule_dispense_now(volatile bool* stop_flag) {
-    // Returns true if we should advance to next treat, false if aborted by external stop
+// =====================================================
+// Shared dispense helpers for schedule
+// =====================================================
+
+// Treat #1 schedule behavior = manual sequence
+static bool schedule_dispense_manual_sequence_now(volatile bool* stop_flag) {
+    // Return true if counters advanced. False if aborted by external stop during motor run.
+    Serial.println("Schedule treat #1: manual-sequence dispense");
+
+    // 1) Beep + LED ON
+    audio_play_tone_1s();
+    setPCF8574Pin(4, false); // LED ON
+
+    // 2) Lights stay on for 5 seconds
+    delay(5000);
+
+    // 3) Beep again
+    audio_play_tone_1s();
+
+    // 4) Dispense (motor + IR + shared stop logic)
+    Motor_Start();
+    IR_Start();
+
+    const unsigned long MOTOR_TIMEOUT = TRAIN_MOTOR_RUN_MS;
+    MotorStopReason reason = run_motor_with_treat_logic(MOTOR_TIMEOUT, stop_flag);
 
     full_stop();
 
-    //play_treat_audio();
-    audio_play_tone_1s();
+    Serial.print("Schedule manual-seq stop reason: ");
+    Serial.println((int)reason);
+
+    if (reason == STOP_EXTERNAL_REQUEST) {
+        Serial.println("Schedule stopped by user during treat #1; not incrementing counters.");
+        return false;
+    }
+
+    schedule_treats_dispensed++;
+    update_schedule_3_ui();
+    current_treat_index++;
+    return true;
+}
+
+// Treat #N (N>=2) schedule behavior = foot-switch required window (handled in timer tick)
+// When foot switch is pressed, we call this to actually dispense:
+static bool schedule_dispense_now_on_footswitch(volatile bool* stop_flag) {
+    // Return true if counters advanced. False if aborted by external stop during motor run.
+    Serial.println("Schedule foot-switch dispense NOW");
+
+    full_stop();
+
+    // Optional "confirmation" tone right at dispense start
+    // audio_play_tone_1s();
 
     setPCF8574Pin(4, false); // LED ON
     Motor_Start();
     IR_Start();
 
-    const unsigned long MOTOR_TIMEOUT = 5000;
+    const unsigned long MOTOR_TIMEOUT = TRAIN_MOTOR_RUN_MS;
     MotorStopReason reason = run_motor_with_treat_logic(MOTOR_TIMEOUT, stop_flag);
 
     full_stop();
 
-    Serial.print("Schedule dispense stop reason: ");
+    Serial.print("Schedule foot-switch stop reason: ");
     Serial.println((int)reason);
 
     if (reason == STOP_EXTERNAL_REQUEST) {
-        Serial.println("Schedule stopped by user during dispense; not incrementing counters.");
-        setPCF8574Pin(4, true);
+        Serial.println("Schedule stopped by user during foot-switch dispense; not incrementing counters.");
         return false;
     }
 
-    //play_treat_audio();
-    audio_play_tone_1s();
-    //delay(2000);
-    setPCF8574Pin(4, true); // LED OFF
-
     schedule_treats_dispensed++;
     update_schedule_3_ui();
-
-    current_treat_index++; // <-- CRITICAL: advance index for treat #2/#3/etc
+    current_treat_index++;
     return true;
 }
 
 // ---------------------------
-// Dispense entrypoint used by schedule (treat #1 or training mode)
+// Dispense entrypoint used by schedule
 // ---------------------------
 void schedule_dispense_treat() {
-    Serial.println("=== Schedule Treat Dispense ===");
+    Serial.println("=== Schedule Treat Trigger ===");
 
-#if SCHEDULE_REQUIRE_BUTTON
-    // Treat 1 dispenses immediately, others are button-gated training flow
+#if SCHEDULE_REQUIRE_FOOTSWITCH
     if (current_treat_index == 0) {
-        Serial.println("First treat - dispensing immediately");
-        (void)schedule_dispense_now(&schedule_stop_requested);
+        // Treat #1 uses manual sequence immediately
+        (void)schedule_dispense_manual_sequence_now(&schedule_stop_requested);
     } else {
-        Serial.printf("Treat %d - starting training sequence\n", current_treat_index + 1);
+        // Treat #2..N require foot switch within a 20s window
         schedule_waiting_for_button = true;
-        schedule_train_state = 0;
         schedule_state_start_time = millis();
-        schedule_led_blink_state = false;
-        schedule_last_blink = millis();
+        schedule_last_tone_ms = schedule_state_start_time - 5000UL; // force immediate tone
+        Serial.printf("Schedule treat %d: waiting for FOOT SWITCH (20s)\n", current_treat_index + 1);
     }
 #else
-    // Automatic scheduled dispense: ALL treats dispense immediately when called
-    (void)schedule_dispense_now(&schedule_stop_requested);
+    // If you ever revert behavior, you can implement pure auto here
+    (void)schedule_dispense_manual_sequence_now(&schedule_stop_requested);
 #endif
 }
 
@@ -525,112 +560,48 @@ void schedule_timer_tick(lv_timer_t * timer) {
         update_schedule_3_ui();
     }
 
-#if SCHEDULE_REQUIRE_BUTTON
-    // If we are in the schedule button-gated training flow
+#if SCHEDULE_REQUIRE_FOOTSWITCH
+    // If we are currently waiting for foot switch for a scheduled treat (#2..N)
     if (schedule_waiting_for_button) {
-        bool start_pressed = button_edge_pressed();
+        // GUARD: keep motor outputs OFF during wait window (prevents any glitches)
+        setPCF8574Pin(0, false);
+        setPCF8574Pin(1, false);
 
-        switch (schedule_train_state) {
-            case 0: { // LED ON for 5s
-                led_set_solid(true);
-                static bool audio0 = false;
-                if (!audio0) { audio_play_tone_1s(); audio0 = true; }
+        // LED solid ON during wait window
+        setPCF8574Pin(4, false);
 
-                if (start_pressed) {
-                    schedule_train_state = 10;
-                    schedule_state_start_time = now;
-                    audio0 = false;
-                    Serial.println("Button pressed - starting treat dispense");
-                } else if (now - schedule_state_start_time > 5000) {
-                    schedule_train_state = 1;
-                    schedule_state_start_time = now;
-                    audio0 = false;
-                    Serial.println("Moving to LED OFF state");
-                }
-                break;
-            }
-
-            case 1: { // LED OFF 2s
-                led_set_solid(false);
-                if (start_pressed) {
-                    schedule_train_state = 10;
-                    schedule_state_start_time = now;
-                    Serial.println("Button pressed - starting treat dispense");
-                } else if (now - schedule_state_start_time > 2000) {
-                    schedule_train_state = 2;
-                    schedule_state_start_time = now;
-                    Serial.println("Moving to second LED ON state");
-                }
-                break;
-            }
-
-            case 2: { // LED ON 5s
-                led_set_solid(true);
-                static bool audio2 = false;
-                if (!audio2) { audio_play_tone_1s(); audio2 = true; }
-
-                if (start_pressed) {
-                    schedule_train_state = 10;
-                    schedule_state_start_time = now;
-                    audio2 = false;
-                    Serial.println("Button pressed - starting treat dispense");
-                } else if (now - schedule_state_start_time > 5000) {
-                    schedule_train_state = 3;
-                    schedule_state_start_time = now;
-                    schedule_last_blink = now;
-                    led_blink_mode = true;
-                    schedule_led_blink_state = false;
-                    audio2 = false;
-                    Serial.println("Moving to blink state");
-                }
-                break;
-            }
-
-            case 3: { // blink 5s
-                static bool audiob = false;
-                if (!audiob) { audio_play_tone_1s(); audiob = true; }
-
-                if (start_pressed) {
-                    schedule_train_state = 10;
-                    schedule_state_start_time = now;
-                    led_blink_mode = false;
-                    audiob = false;
-                    Serial.println("Button pressed - starting treat dispense");
-                } else if (now - schedule_state_start_time > 5000) {
-                    // Skip treat and continue schedule
-                    schedule_waiting_for_button = false;
-                    led_blink_mode = false;
-                    led_set_solid(false);
-                    audiob = false;
-                    current_treat_index++;
-                    Serial.println("Button timeout - skipping treat and continuing schedule");
-                } else {
-                    if (now - schedule_last_blink >= 250) {
-                        schedule_last_blink = now;
-                        schedule_led_blink_state = !schedule_led_blink_state;
-                        led_apply(schedule_led_blink_state);
-                    }
-                }
-                break;
-            }
-
-            case 10: { // dispense scheduled treat with shared logic
-                led_blink_mode = false;
-                led_set_solid(false);
-
-                Serial.println("Dispensing scheduled treat (button-gated)");
-                bool advanced = schedule_dispense_now(&schedule_stop_requested);
-
-                schedule_waiting_for_button = false;
-                schedule_train_state = 0;
-
-                if (advanced) {
-                    Serial.printf("Scheduled treat dispensed! Total: %d\n", schedule_treats_dispensed);
-                }
-                break;
-            }
+        // Tone every 5 seconds (1 second tone)
+        if (now - schedule_last_tone_ms >= 5000UL) {
+            schedule_last_tone_ms = now;
+            audio_play_tone_1s();
         }
 
+        // Timeout window: 20 seconds, then skip treat
+        if (now - schedule_state_start_time >= 20000UL) {
+            Serial.printf("Schedule treat %d: foot-switch TIMEOUT -> skipping\n", current_treat_index + 1);
+            schedule_waiting_for_button = false;
+            setPCF8574Pin(4, true); // LED OFF
+
+            // Skip this treat and continue schedule
+            current_treat_index++;
+            return;
+        }
+
+        // Foot switch pressed -> dispense ONE treat
+        if (footswitch_pressed_debounced(now)) {
+            Serial.printf("Schedule treat %d: foot-switch PRESSED -> dispensing\n", current_treat_index + 1);
+
+            schedule_waiting_for_button = false;
+
+            bool advanced = schedule_dispense_now_on_footswitch(&schedule_stop_requested);
+            (void)advanced;
+
+            // Ensure LED off after dispense
+            setPCF8574Pin(4, true);
+            return;
+        }
+
+        // Still waiting
         return;
     }
 #endif
@@ -658,7 +629,7 @@ void schedule_timer_tick(lv_timer_t * timer) {
     if (current_treat_index < total_scheduled_treats) {
         int next_treat_time = scheduled_times[current_treat_index];
 
-        // ONLY print checking treat #2 (index 1), schedule mode, rate-limited 30s
+        // Debug (optional)
         if (schedule_is_running && current_treat_index == 1 && every_30s(now)) {
             Serial.printf("Checking treat 2: current_time=%d min, scheduled=%d min\n",
                           elapsed_minutes, next_treat_time);
@@ -666,13 +637,11 @@ void schedule_timer_tick(lv_timer_t * timer) {
 
         if (elapsed_minutes >= next_treat_time) {
             if (!dispense_in_progress && (now - last_dispense_time >= 30000UL)) {
-
-                // Mark BEFORE calling (dispense is blocking)
                 dispense_in_progress = true;
                 last_dispense_time = now;
 
-                Serial.printf("TRIGGER dispense: treat=%d, now=%d min, scheduled=%d min\n",
-                              current_treat_index + 1, elapsed_minutes, next_treat_time);
+                Serial.printf("TRIGGER schedule treat: idx=%d (treat=%d), now=%d min, scheduled=%d min\n",
+                              current_treat_index, current_treat_index + 1, elapsed_minutes, next_treat_time);
 
                 schedule_dispense_treat();
 
@@ -733,7 +702,78 @@ void IR_Stop() {
 }
 
 // ---------------------------
-// Train dispense state machine (uses shared motor logic)
+// Standalone foot-switch training tick (20s window)
+// ---------------------------
+static void footswitch_train_tick(lv_timer_t* timer) {
+    (void)timer;
+
+    const unsigned long now = millis();
+
+    if (!foot_train_active) {
+        setPCF8574Pin(4, true);
+        if (foot_train_timer) { lv_timer_del(foot_train_timer); foot_train_timer = NULL; }
+        return;
+    }
+
+    // GUARD: keep motor outputs OFF until a valid footswitch press
+    setPCF8574Pin(0, false);
+    setPCF8574Pin(1, false);
+
+    // LED ON solid for the whole 20s window (P4 active-low)
+    setPCF8574Pin(4, false);
+
+    // Tone every 5 seconds (1 second tone)
+    if (now - foot_train_last_tone_ms >= 5000UL) {
+        foot_train_last_tone_ms = now;
+        audio_play_tone_1s();
+    }
+
+    // Timeout: 20 seconds -> no treat dispensed
+    if (now - foot_train_start_ms >= 20000UL) {
+        Serial.println("Foot-switch training: TIMEOUT (no treat dispensed).");
+
+        foot_train_active = false;
+        full_stop();
+        setPCF8574Pin(4, true);
+
+        if (foot_train_timer) {
+            lv_timer_del(foot_train_timer);
+            foot_train_timer = NULL;
+        }
+        return;
+    }
+
+    // If foot switch pressed within 20 seconds -> dispense exactly one treat
+    if (footswitch_pressed_debounced(now)) {
+        Serial.println("Foot-switch training: PRESSED -> dispensing 1 treat.");
+
+        // Stop the training timer first so we cannot re-enter
+        foot_train_active = false;
+        if (foot_train_timer) {
+            lv_timer_del(foot_train_timer);
+            foot_train_timer = NULL;
+        }
+
+        full_stop();
+
+        setPCF8574Pin(4, false); // LED ON during dispense
+        Motor_Start();
+        IR_Start();
+
+        const unsigned long MOTOR_TIMEOUT = TRAIN_MOTOR_RUN_MS;
+        MotorStopReason reason = run_motor_with_treat_logic(MOTOR_TIMEOUT, nullptr);
+
+        full_stop();
+
+        Serial.print("Foot-switch dispense stop reason: ");
+        Serial.println((int)reason);
+
+        setPCF8574Pin(4, true); // LED OFF
+    }
+}
+
+// ---------------------------
+// Train dispense state machine (button training) (unchanged)
 // ---------------------------
 void train_dispense_tick(lv_timer_t * timer) {
     if (train_dispense_stop_requested) {
@@ -855,30 +895,36 @@ void train_dispense_tick(lv_timer_t * timer) {
 // ---------------------------
 // Actions (LVGL events)
 // ---------------------------
+
+// Manual treat behavior per your request:
+// Press button -> beep+LED ON -> wait 5s (LED stays on) -> beep -> dispense
 void action_manual_dispense_treat(lv_event_t * e) {
     (void)e;
-    Serial.println("\n=== Manual Treat Dispense Started ===");
+    Serial.println("\n=== Manual Treat Dispense (timed) Started ===");
 
-    //play_treat_audio();
+    // 1) Beep + LED ON
     audio_play_tone_1s();
     setPCF8574Pin(4, false); // LED ON
-    delay(200);
 
+    // 2) Wait 5 seconds (LED stays ON)
+    delay(5000);
+
+    // 3) Beep
+    audio_play_tone_1s();
+
+    // 4) Dispense treat
     Motor_Start();
     IR_Start();
 
-    const unsigned long MOTOR_TIMEOUT = 5000;
+    const unsigned long MOTOR_TIMEOUT = TRAIN_MOTOR_RUN_MS;
     MotorStopReason reason = run_motor_with_treat_logic(MOTOR_TIMEOUT, nullptr);
 
-    full_stop();
+    full_stop(); // turns motor + LED off
 
     Serial.print("Manual stop reason: ");
     Serial.println((int)reason);
 
-    //delay(2000);
-    setPCF8574Pin(4, true); // LED OFF
-
-    Serial.println("=== Manual Treat Dispense Complete ===\n");
+    Serial.println("=== Manual Treat Dispense (timed) Complete ===\n");
 }
 
 void action_train_dispense_treat(lv_event_t * e) {
@@ -894,6 +940,33 @@ void action_train_dispense_treat(lv_event_t * e) {
     state_start_time = millis();
 
     lv_timer_create(train_dispense_tick, 50, NULL);
+}
+
+// Standalone foot-switch training action (20s window)
+void action_train_footswitch_dispense_start(lv_event_t* e) {
+    (void)e;
+
+    Serial.println("=== Foot-switch Training START (20s window) ===");
+
+    if (foot_train_timer) {
+        lv_timer_del(foot_train_timer);
+        foot_train_timer = NULL;
+    }
+
+    // IMPORTANT: init can glitch outputs -> do init FIRST, then full_stop AFTER
+    initPCF8574Pins();
+    delay(50);
+    full_stop();
+
+    // Ensure P3 behaves as input (PCF quasi-bidirectional): write HIGH to read it
+    setPCF8574Pin(3, false);
+
+    foot_train_active = true;
+    foot_train_start_ms = millis();
+    foot_train_last_tone_ms = foot_train_start_ms - 5000UL; // immediate tone
+
+    setPCF8574Pin(4, false); // LED ON
+    foot_train_timer = lv_timer_create(footswitch_train_tick, 50, NULL);
 }
 
 void action_train_dispense_stop(lv_event_t * e) {
@@ -961,7 +1034,7 @@ void action_scheduletreatdispensestart(lv_event_t * e) {
 
         schedule_timer = lv_timer_create(schedule_timer_tick, 100, NULL);
 
-        Serial.println("Dispensing first treat immediately");
+        Serial.println("Triggering treat #1 immediately (manual sequence)");
         schedule_dispense_treat();
 
         Serial.printf("Schedule started: %d treats/hr over %d hours\n",
@@ -999,9 +1072,6 @@ void action_scheduletreatdispensestop(lv_event_t * e) {
     current_treat_index = 0;
 
     schedule_waiting_for_button = false;
-    schedule_train_state = 0;
-    led_blink_mode = false;
-    led_set_solid(false);
 
     if (schedule_timer != NULL) {
         lv_timer_del((lv_timer_t*)schedule_timer);
