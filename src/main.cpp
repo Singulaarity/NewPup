@@ -1,8 +1,8 @@
 //***************************************************************************************/
-// Pup Button 2025
-// Author: Dustin Wish
-// Date: 8/7/2025
-// Version 1.35
+// Pup Button 2026
+// Author: Nick Lewis
+// Date: 2/17/2026
+// Version 2.10
 // Platform: ESP32-2432S028R
 //***************************************************************************************/
 // Include all libraries
@@ -123,9 +123,9 @@ void setup() {
     Serial.begin(115200);
     delay(1000);
 
-    String LVGL_Arduino = "Pup Button Firmware\nVersion 1.0\n";
+    String LVGL_Arduino = "Pup Button Firmware\nVersion 2.10\n";
     Serial.println("Pup Button Firmware");
-    Serial.println("Version 1.0");
+    Serial.println("Version 2.10");
     LVGL_Arduino += String('V') + lv_version_major() + "." + lv_version_minor() + "." + lv_version_patch();
     Serial.println(LVGL_Arduino);
 
