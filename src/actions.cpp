@@ -1,6 +1,15 @@
 // actions.cpp (clean, compile-safe version)
 //
-// Updates included:
+// ✅ This revision makes the IR remote (PCF P7, active-low) trigger the foot-switch
+// training window “truly anytime after boot” by providing an init entrypoint that
+// starts the poll timer immediately (instead of lazily when other actions run).
+//
+// IMPORTANT INTEGRATION NOTE:
+// - Call actions_init(); ONCE after LVGL + I2C/PCF are initialized (typically in setup()
+//   after you init LVGL/UI and initPCF8574Pins()).
+// - After that, the P7 remote trigger works even if scheduled mode is not running.
+//
+// Behaviors included:
 // 1) Manual treat mode sequence:
 //      - Beep 1s + LED ON (P4 active-low)
 //      - LED stays ON
@@ -22,9 +31,9 @@
 //      - Treat #1 follows the manual treat sequence (beep+LED, wait 5s, beep, dispense)
 //      - Treat #2..N require foot-switch activation (20s window). If not pressed -> skip treat.
 //
-// 4) NEW: IR remote trigger on PCF P7 (active-low):
+// 4) IR remote trigger on PCF P7 (active-low):
 //      - Debounced edge on P7 starts the standalone foot-switch training window at ANY time
-//      - Implemented via a small LVGL timer polling P7.
+//      - Implemented via LVGL timer polling P7 (started immediately by actions_init()).
 //
 
 #include <Arduino.h>
@@ -314,6 +323,7 @@ static inline bool button_edge_pressed() {
 // =====================================================
 static lv_timer_t* remote_poll_timer = NULL;
 
+// Debounced edge on P7 (active-low)
 static inline bool remote_p7_edge_pressed(unsigned long now_ms) {
     bool raw = !readPCF8574Pin(7); // active-low => pressed when LOW
     static bool last_raw = false;
@@ -349,6 +359,7 @@ static void start_footswitch_training_window() {
     full_stop();
 
     // Ensure P3 + P7 behave as inputs (PCF quasi-bidirectional): write HIGH to read them
+    // (In your API, setPCF8574Pin(pin, false) => output HIGH / released)
     setPCF8574Pin(3, false);
     setPCF8574Pin(7, false);
 
@@ -381,13 +392,15 @@ static void ensure_remote_poll_timer_running() {
     }
 }
 
+// ✅ Call this ONCE after LVGL + PCF/I2C are ready to make P7 work immediately after boot
+void actions_init() {
+    ensure_remote_poll_timer_running();
+}
+
 // ---------------------------
 // UI updater
 // ---------------------------
 void update_schedule_3_ui() {
-    // Keep remote trigger alive (safe to call repeatedly)
-    ensure_remote_poll_timer_running();
-
     // Treats per hour
     if (objects.treats_per_hour) {
         char treats_str[10];
@@ -592,9 +605,6 @@ void schedule_dispense_treat() {
 void schedule_timer_tick(lv_timer_t * timer) {
     (void)timer;
 
-    // Keep remote trigger alive (safe to call repeatedly)
-    ensure_remote_poll_timer_running();
-
     if (!schedule_is_running || schedule_is_paused) return;
 
     unsigned long now = millis();
@@ -769,9 +779,6 @@ void IR_Stop() {
 static void footswitch_train_tick(lv_timer_t* timer) {
     (void)timer;
 
-    // Keep remote trigger alive
-    ensure_remote_poll_timer_running();
-
     const unsigned long now = millis();
 
     if (!foot_train_active) {
@@ -841,8 +848,6 @@ static void footswitch_train_tick(lv_timer_t* timer) {
 // Button training state machine (PIN_BUTTON) (unchanged behavior)
 // ---------------------------
 void train_dispense_tick(lv_timer_t * timer) {
-    ensure_remote_poll_timer_running();
-
     if (train_dispense_stop_requested) {
         full_stop();
         led_set_solid(false);
@@ -967,7 +972,6 @@ void train_dispense_tick(lv_timer_t * timer) {
 // Press button -> beep+LED ON -> wait 5s (LED stays on) -> beep -> dispense
 void action_manual_dispense_treat(lv_event_t * e) {
     (void)e;
-    ensure_remote_poll_timer_running();
 
     Serial.println("\n=== Manual Treat Dispense (timed) Started ===");
 
@@ -998,7 +1002,6 @@ void action_manual_dispense_treat(lv_event_t * e) {
 
 void action_train_dispense_treat(lv_event_t * e) {
     (void)e;
-    ensure_remote_poll_timer_running();
 
     full_stop();
     initPCF8574Pins();
@@ -1016,13 +1019,11 @@ void action_train_dispense_treat(lv_event_t * e) {
 // Standalone foot-switch training action (20s window) - can also be triggered by P7 remote
 void action_train_footswitch_dispense_start(lv_event_t* e) {
     (void)e;
-    ensure_remote_poll_timer_running();
     start_footswitch_training_window();
 }
 
 void action_train_dispense_stop(lv_event_t * e) {
     (void)e;
-    ensure_remote_poll_timer_running();
 
     Serial.println("=== Train Dispense STOP requested ===");
     train_dispense_stop_requested = true;
@@ -1031,8 +1032,6 @@ void action_train_dispense_stop(lv_event_t * e) {
 
 void action_schedule_add_treat_num(lv_event_t * e) {
     (void)e;
-    ensure_remote_poll_timer_running();
-
     int idx = lv_roller_get_selected(objects.schedule_1_treatsnumber);
     selected_treats_number = idx + 1;
     Serial.print("Treats to dispense selected: ");
@@ -1042,8 +1041,6 @@ void action_schedule_add_treat_num(lv_event_t * e) {
 
 void action_schedule_add_hours(lv_event_t * e) {
     (void)e;
-    ensure_remote_poll_timer_running();
-
     int idx = lv_roller_get_selected(objects.schedule_2_hours_to_dispense);
     selected_hours_to_dispense = idx + 1;
     Serial.print("Hours to dispense selected: ");
@@ -1053,16 +1050,12 @@ void action_schedule_add_hours(lv_event_t * e) {
 
 void action_schedule_2_next(lv_event_t * e) {
     (void)e;
-    ensure_remote_poll_timer_running();
-
     Serial.println("Transitioning to Schedule 3 screen");
     Serial.printf("Current values: treats=%d, hours=%d\n", selected_treats_number, selected_hours_to_dispense);
 }
 
 void action_scheduletreatdispensestart(lv_event_t * e) {
     (void)e;
-    ensure_remote_poll_timer_running();
-
     Serial.println("=== Schedule Dispense START ===");
     full_stop();
 
@@ -1111,8 +1104,6 @@ void action_scheduletreatdispensestart(lv_event_t * e) {
 
 void action_scheduletreatdispensepause(lv_event_t * e) {
     (void)e;
-    ensure_remote_poll_timer_running();
-
     if (schedule_is_running && !schedule_is_paused) {
         schedule_is_paused = true;
         schedule_pause_time = millis();
@@ -1125,8 +1116,6 @@ void action_scheduletreatdispensepause(lv_event_t * e) {
 
 void action_scheduletreatdispensestop(lv_event_t * e) {
     (void)e;
-    ensure_remote_poll_timer_running();
-
     Serial.println("=== Schedule Dispense STOPPED ===");
 
     schedule_stop_requested = true;

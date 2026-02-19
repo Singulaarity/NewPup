@@ -7,6 +7,7 @@
 extern "C" {
 #endif
 
+void actions_init(void);
 void init_audio(void);
 void setPCF8574Pin(uint8_t pin, bool state);
 void action_manual_dispense_treat(lv_event_t * e);
