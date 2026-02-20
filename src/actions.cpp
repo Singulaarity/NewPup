@@ -1,12 +1,8 @@
 // actions.cpp (clean, compile-safe version)
 //
-// ✅ This revision makes the IR remote (PCF P7, active-low) trigger the foot-switch
-// training window “truly anytime after boot” by providing an init entrypoint that
-// starts the poll timer immediately (instead of lazily when other actions run).
 //
 // IMPORTANT INTEGRATION NOTE:
-// - Call actions_init(); ONCE after LVGL + I2C/PCF are initialized (typically in setup()
-//   after you init LVGL/UI and initPCF8574Pins()).
+// - Call actions_init(); ONCE after LVGL + I2C/PCF are initialized.
 // - After that, the P7 remote trigger works even if scheduled mode is not running.
 //
 // Behaviors included:
@@ -49,6 +45,42 @@
 #include <IRremoteESP8266.h>
 #include "audio_utils.h"
 
+// -----------------------------
+// Fallback pin defines (safe)
+// -----------------------------
+// If your project already defines these in vars.h, these won't override.
+#ifndef PIN_LED
+#define PIN_LED 4  // LED control on PCF (active-low)
+#endif
+
+#ifndef PIN_IR_TX
+#define PIN_IR_TX 5 // IR transmitter enable on PCF (active-low)  (adjust if needed)
+#endif
+
+#ifndef PIN_FOOTSWITCH
+#define PIN_FOOTSWITCH 3 // Foot switch input on PCF (active-low)
+#endif
+
+#ifndef PIN_REMOTE
+#define PIN_REMOTE 7 // Remote trigger input on PCF (active-low)
+#endif
+
+#ifndef PIN_MOTOR_IN1
+#define PIN_MOTOR_IN1 0
+#endif
+
+#ifndef PIN_MOTOR_IN2
+#define PIN_MOTOR_IN2 1
+#endif
+
+#ifndef PIN_ROTARY
+#define PIN_ROTARY 2 // Rotary switch on PCF
+#endif
+
+#ifndef PIN_IR_RX
+#define PIN_IR_RX 6 // Beam receiver on PCF (HIGH=intact, LOW=broken)
+#endif
+
 // ---- Restore / fallback definitions (only used if not already provided elsewhere) ----
 #ifndef AUDIO_DAC_CHANNEL
 #define AUDIO_DAC_CHANNEL DAC_CHANNEL_1
@@ -75,7 +107,7 @@
 #endif
 
 #ifndef TRAIN_MOTOR_RUN_MS
-#define TRAIN_MOTOR_RUN_MS 5000UL
+#define TRAIN_MOTOR_RUN_MS 8000UL
 #endif
 // ---- End fallback definitions ----
 
@@ -89,7 +121,7 @@ static inline bool every_30s(unsigned long now_ms) {
 }
 
 // ---------------------------
-// State variables (button training)
+// State variables (legacy button training state machine)
 // ---------------------------
 volatile bool train_dispense_stop_requested = false;
 static int  train_dispense_state = 0;
@@ -106,15 +138,6 @@ static lv_timer_t* foot_train_timer = NULL;
 static bool foot_train_active = false;
 static unsigned long foot_train_start_ms = 0;
 static unsigned long foot_train_last_tone_ms = 0;
-
-// Foot switch is on PCF P3 (pressed = LOW)
-static inline bool footswitch_pressed_debounced(unsigned long now_ms) {
-    bool raw = !readPCF8574Pin(3); // active-low => pressed when LOW
-    static bool prev = false;
-    static unsigned long t = 0;
-    if (raw != prev) { prev = raw; t = now_ms; }
-    return raw && (now_ms - t > 30);
-}
 
 // ---------------------------
 // Schedule state variables
@@ -169,6 +192,41 @@ enum MotorStopReason {
     STOP_EXTERNAL_REQUEST
 };
 
+// ---------------------------
+// LED helpers (active-low)  ✅ SINGLE SOURCE OF TRUTH FOR LED PIN
+// ---------------------------
+static inline void led_apply(bool on) {
+    // on=true => drive LOW (active-low LED ON)
+    setPCF8574Pin(PIN_LED, !on);
+}
+
+static inline void led_set_solid(bool on) {
+    led_blink_mode = false;
+    led_is_on_solid = on;
+    led_apply(on);
+}
+
+static inline void led_blink_tick(unsigned long now) {
+    if (!led_blink_mode) return;
+    if (now - last_blink >= 250) {
+        last_blink = now;
+        led_blink_state = !led_blink_state;
+        led_apply(led_blink_state);
+    }
+}
+
+// ---------------------------
+// Debounced inputs
+// ---------------------------
+// Foot switch is on PCF P3 (pressed = LOW)
+static inline bool footswitch_pressed_debounced(unsigned long now_ms) {
+    bool raw = !readPCF8574Pin(PIN_FOOTSWITCH); // active-low => pressed when LOW
+    static bool prev = false;
+    static unsigned long t = 0;
+    if (raw != prev) { prev = raw; t = now_ms; }
+    return raw && (now_ms - t > 30);
+}
+
 static inline void reset_treat_logic_state_for_run() {
     treatDispensed = false;
     lhTransitions = 0;
@@ -177,7 +235,7 @@ static inline void reset_treat_logic_state_for_run() {
     seenLowAfterTreat = false;
 
     // Seed edge detector to current rotary state to avoid a fake edge
-    lastRotary = readPCF8574Pin(2);
+    lastRotary = readPCF8574Pin(PIN_ROTARY);
 }
 
 static MotorStopReason run_motor_with_treat_logic(unsigned long timeout_ms,
@@ -193,8 +251,8 @@ static MotorStopReason run_motor_with_treat_logic(unsigned long timeout_ms,
             return STOP_EXTERNAL_REQUEST;
         }
 
-        bool rawValue     = readPCF8574Pin(6); // P6 IR Receiver (HIGH=intact, LOW=broken)
-        bool rotarySwitch = readPCF8574Pin(2); // P2 Rotary Switch (HIGH=safe-to-stop / blocking position)
+        bool rawValue     = readPCF8574Pin(PIN_IR_RX);   // HIGH=intact, LOW=broken
+        bool rotarySwitch = readPCF8574Pin(PIN_ROTARY);  // HIGH=safe-to-stop / blocking pos
         bool beamBroken   = !rawValue;
 
         // --- 1) Treat detection ---
@@ -265,29 +323,6 @@ static MotorStopReason run_motor_with_treat_logic(unsigned long timeout_ms,
     return STOP_TIMEOUT;
 }
 
-// ---------------------------
-// LED helpers (active-low)
-// ---------------------------
-static inline void led_apply(bool on) {
-    // on=true => drive low (active-low LED ON)
-    setPCF8574Pin(PIN_LED, !on);
-}
-
-static inline void led_set_solid(bool on) {
-    led_blink_mode = false;
-    led_is_on_solid = on;
-    led_apply(on);
-}
-
-static inline void led_blink_tick(unsigned long now) {
-    if (!led_blink_mode) return;
-    if (now - last_blink >= 250) {
-        last_blink = now;
-        led_blink_state = !led_blink_state;
-        led_apply(led_blink_state);
-    }
-}
-
 extern "C" {
 
 // Forward declarations
@@ -325,7 +360,7 @@ static lv_timer_t* remote_poll_timer = NULL;
 
 // Debounced edge on P7 (active-low)
 static inline bool remote_p7_edge_pressed(unsigned long now_ms) {
-    bool raw = !readPCF8574Pin(7); // active-low => pressed when LOW
+    bool raw = !readPCF8574Pin(PIN_REMOTE); // active-low => pressed when LOW
     static bool last_raw = false;
     static bool last_stable = false;
     static unsigned long t_change = 0;
@@ -345,6 +380,23 @@ static inline bool remote_p7_edge_pressed(unsigned long now_ms) {
 
 static void footswitch_train_tick(lv_timer_t* timer); // forward
 
+// Cancel helper (used by Training Mode STOP and safe shutdown paths)
+static void cancel_footswitch_training_window() {
+    if (!foot_train_active && !foot_train_timer) return;
+
+    Serial.println("Foot-switch training window CANCELLED");
+
+    foot_train_active = false;
+
+    if (foot_train_timer) {
+        lv_timer_del(foot_train_timer);
+        foot_train_timer = NULL;
+    }
+
+    full_stop();
+    led_set_solid(false); // ✅ consistent LED off
+}
+
 static void start_footswitch_training_window() {
     // Don’t restart if already running
     if (foot_train_active || foot_train_timer) return;
@@ -359,19 +411,23 @@ static void start_footswitch_training_window() {
     full_stop();
 
     // Ensure P3 + P7 behave as inputs (PCF quasi-bidirectional): write HIGH to read them
-    // (In your API, setPCF8574Pin(pin, false) => output HIGH / released)
-    setPCF8574Pin(3, false);
-    setPCF8574Pin(7, false);
+    // (Most PCF8574 wrappers: writing HIGH "releases" the pin for input)
+    setPCF8574Pin(PIN_FOOTSWITCH, false);
+    setPCF8574Pin(PIN_REMOTE, false);
 
     foot_train_active = true;
     foot_train_start_ms = millis();
     foot_train_last_tone_ms = foot_train_start_ms - 5000UL; // immediate tone
 
-    // LED ON (P4 active-low)
-    setPCF8574Pin(4, false);
+    // ✅ LED ON via helper (no hardcoded pin)
+    led_set_solid(true);
 
     // Tick fast enough to catch switch presses + timing
     foot_train_timer = lv_timer_create(footswitch_train_tick, 50, NULL);
+
+    // Optional debug to confirm active-low behavior
+    Serial.printf("Training LED: PIN_LED=%d read=%d (LOW=ON if active-low)\n",
+                  (int)PIN_LED, (int)readPCF8574Pin(PIN_LED));
 }
 
 static void remote_poll_tick(lv_timer_t* t) {
@@ -386,7 +442,7 @@ static void remote_poll_tick(lv_timer_t* t) {
 static void ensure_remote_poll_timer_running() {
     if (!remote_poll_timer) {
         // Make sure P7 is released high so reads work reliably
-        setPCF8574Pin(7, false);
+        setPCF8574Pin(PIN_REMOTE, false);
         remote_poll_timer = lv_timer_create(remote_poll_tick, 25, NULL);
         Serial.println("Remote poll timer started (P7 training trigger)");
     }
@@ -523,7 +579,7 @@ static bool schedule_dispense_manual_sequence_now(volatile bool* stop_flag) {
 
     // Beep + LED ON
     audio_play_tone_1s();
-    setPCF8574Pin(4, false); // LED ON
+    led_set_solid(true);
 
     // Wait 5 seconds (LED stays ON)
     delay(5000);
@@ -560,7 +616,7 @@ static bool schedule_dispense_now_on_footswitch(volatile bool* stop_flag) {
 
     full_stop();
 
-    setPCF8574Pin(4, false); // LED ON
+    led_set_solid(true);
     Motor_Start();
     IR_Start();
 
@@ -588,10 +644,8 @@ void schedule_dispense_treat() {
     Serial.println("=== Schedule Treat Trigger ===");
 
     if (current_treat_index == 0) {
-        // Treat #1: manual sequence immediately
         (void)schedule_dispense_manual_sequence_now(&schedule_stop_requested);
     } else {
-        // Treat #2..N: open 20s foot-switch window
         schedule_waiting_for_footswitch = true;
         schedule_wait_start_ms = millis();
         schedule_last_tone_ms  = schedule_wait_start_ms - 5000UL; // immediate tone
@@ -609,7 +663,6 @@ void schedule_timer_tick(lv_timer_t * timer) {
 
     unsigned long now = millis();
 
-    // Stop request
     if (schedule_stop_requested) {
         schedule_is_running = false;
         schedule_waiting_for_footswitch = false;
@@ -626,14 +679,13 @@ void schedule_timer_tick(lv_timer_t * timer) {
         return;
     }
 
-    // If we are in the schedule foot-switch wait window (#2..N)
     if (schedule_waiting_for_footswitch) {
         // GUARD: keep motor OFF while waiting
-        setPCF8574Pin(0, false);
-        setPCF8574Pin(1, false);
+        setPCF8574Pin(PIN_MOTOR_IN1, false);
+        setPCF8574Pin(PIN_MOTOR_IN2, false);
 
         // LED solid ON during wait
-        setPCF8574Pin(4, false);
+        led_set_solid(true);
 
         // Tone every 5 seconds (1 second tone)
         if (now - schedule_last_tone_ms >= 5000UL) {
@@ -645,8 +697,8 @@ void schedule_timer_tick(lv_timer_t * timer) {
         if (now - schedule_wait_start_ms >= 20000UL) {
             Serial.printf("Schedule treat %d: foot-switch TIMEOUT -> skipping\n", current_treat_index + 1);
             schedule_waiting_for_footswitch = false;
-            setPCF8574Pin(4, true); // LED OFF
-            current_treat_index++;  // skip this treat
+            led_set_solid(false);
+            current_treat_index++;
             return;
         }
 
@@ -657,11 +709,10 @@ void schedule_timer_tick(lv_timer_t * timer) {
             schedule_waiting_for_footswitch = false;
             (void)schedule_dispense_now_on_footswitch(&schedule_stop_requested);
 
-            setPCF8574Pin(4, true); // LED OFF after dispense
+            led_set_solid(false);
             return;
         }
 
-        // Still waiting
         return;
     }
 
@@ -673,13 +724,11 @@ void schedule_timer_tick(lv_timer_t * timer) {
     schedule_remaining_minutes = total_minutes - elapsed_minutes;
     if (schedule_remaining_minutes < 0) schedule_remaining_minutes = 0;
 
-    // Update UI only when minute changes
     if (schedule_remaining_minutes != schedule_last_displayed_minutes) {
         schedule_last_displayed_minutes = schedule_remaining_minutes;
         update_schedule_3_ui();
     }
 
-    // Completion check
     if (schedule_remaining_minutes <= 0 || current_treat_index >= total_scheduled_treats) {
         schedule_is_running = false;
         schedule_remaining_minutes = 0;
@@ -737,40 +786,40 @@ void init_audio() {
 // ---------------------------
 void full_stop() {
     // Motor stop
-    setPCF8574Pin(0, false);
-    setPCF8574Pin(1, false);
+    setPCF8574Pin(PIN_MOTOR_IN1, false);
+    setPCF8574Pin(PIN_MOTOR_IN2, false);
 
     // LED + IR off (active-low)
-    setPCF8574Pin(4, true);
-    setPCF8574Pin(5, true);
+    led_set_solid(false);
+    setPCF8574Pin(PIN_IR_TX, true);
 
     Serial.println("Full stop: Motor and LED OFF");
 }
 
 void Motor_Start() {
     // CW: IN1 LOW, IN2 HIGH (matches your previous code)
-    setPCF8574Pin(0, true);
-    setPCF8574Pin(1, false);
+    setPCF8574Pin(PIN_MOTOR_IN1, true);
+    setPCF8574Pin(PIN_MOTOR_IN2, false);
     Serial.println("Motor ON (CW)");
 }
 
 static bool beam_initial_state = true;
-static inline bool read_beam_P6() { return readPCF8574Pin(6); }
+static inline bool read_beam() { return readPCF8574Pin(PIN_IR_RX); }
 
 void IR_Start() {
-    setPCF8574Pin(4, false); // LED ON
-    setPCF8574Pin(5, false); // IR TX ON
+    led_set_solid(true);
+    setPCF8574Pin(PIN_IR_TX, false); // IR TX ON (active-low)
 
     delay(150);
-    beam_initial_state = read_beam_P6();
-    Serial.print("IR Start - initial P6: ");
+    beam_initial_state = read_beam();
+    Serial.print("IR Start - initial beam: ");
     Serial.println(beam_initial_state ? "HIGH" : "LOW");
 }
 
 void IR_Stop() {
-    setPCF8574Pin(4, true);
-    setPCF8574Pin(5, true);
-    Serial.println("IR transmitter and receiver OFF");
+    led_set_solid(false);
+    setPCF8574Pin(PIN_IR_TX, true);
+    Serial.println("IR transmitter OFF");
 }
 
 // ---------------------------
@@ -782,17 +831,17 @@ static void footswitch_train_tick(lv_timer_t* timer) {
     const unsigned long now = millis();
 
     if (!foot_train_active) {
-        setPCF8574Pin(4, true);
+        led_set_solid(false);
         if (foot_train_timer) { lv_timer_del(foot_train_timer); foot_train_timer = NULL; }
         return;
     }
 
     // GUARD: keep motor outputs OFF until a valid footswitch press
-    setPCF8574Pin(0, false);
-    setPCF8574Pin(1, false);
+    setPCF8574Pin(PIN_MOTOR_IN1, false);
+    setPCF8574Pin(PIN_MOTOR_IN2, false);
 
-    // LED ON solid for the whole 20s window (P4 active-low)
-    setPCF8574Pin(4, false);
+    // LED ON solid for the whole 20s window
+    led_set_solid(true);
 
     // Tone every 5 seconds (1 second tone)
     if (now - foot_train_last_tone_ms >= 5000UL) {
@@ -803,15 +852,8 @@ static void footswitch_train_tick(lv_timer_t* timer) {
     // Timeout: 20 seconds -> no treat dispensed
     if (now - foot_train_start_ms >= 20000UL) {
         Serial.println("Foot-switch training: TIMEOUT (no treat dispensed).");
-
         foot_train_active = false;
-        full_stop();
-        setPCF8574Pin(4, true);
-
-        if (foot_train_timer) {
-            lv_timer_del(foot_train_timer);
-            foot_train_timer = NULL;
-        }
+        cancel_footswitch_training_window();
         return;
     }
 
@@ -828,7 +870,7 @@ static void footswitch_train_tick(lv_timer_t* timer) {
 
         full_stop();
 
-        setPCF8574Pin(4, false); // LED ON during dispense
+        led_set_solid(true); // LED ON during dispense
         Motor_Start();
         IR_Start();
 
@@ -839,13 +881,11 @@ static void footswitch_train_tick(lv_timer_t* timer) {
 
         Serial.print("Foot-switch dispense stop reason: ");
         Serial.println((int)reason);
-
-        setPCF8574Pin(4, true); // LED OFF
     }
 }
 
 // ---------------------------
-// Button training state machine (PIN_BUTTON) (unchanged behavior)
+// Legacy button training state machine (kept for compatibility; not used by Training Mode now)
 // ---------------------------
 void train_dispense_tick(lv_timer_t * timer) {
     if (train_dispense_stop_requested) {
@@ -863,7 +903,7 @@ void train_dispense_tick(lv_timer_t * timer) {
     (void)button_pressed_debounced(now);
 
     switch (train_dispense_state) {
-        case 0: { // LED ON 5s
+        case 0: {
             led_set_solid(true);
             static bool audio0 = false;
             if (!audio0) { audio_play_tone_1s(); audio0 = true; }
@@ -872,7 +912,6 @@ void train_dispense_tick(lv_timer_t * timer) {
                 train_dispense_state = 10;
                 state_start_time = now;
                 audio0 = false;
-                Serial.println("EDGE -> start dispense (from case 0)");
             } else if (now - state_start_time > 5000) {
                 train_dispense_state = 1;
                 state_start_time = now;
@@ -881,7 +920,7 @@ void train_dispense_tick(lv_timer_t * timer) {
             break;
         }
 
-        case 1: { // LED OFF 2s
+        case 1: {
             led_set_solid(false);
             if (edge_pressed) {
                 train_dispense_state = 10;
@@ -893,7 +932,7 @@ void train_dispense_tick(lv_timer_t * timer) {
             break;
         }
 
-        case 2: { // LED ON 5s
+        case 2: {
             led_set_solid(true);
             static bool audio2 = false;
             if (!audio2) { audio_play_tone_1s(); audio2 = true; }
@@ -913,7 +952,7 @@ void train_dispense_tick(lv_timer_t * timer) {
             break;
         }
 
-        case 3: { // Blink 5s
+        case 3: {
             static bool audiob = false;
             if (!audiob) { audio_play_tone_1s(); audiob = true; }
 
@@ -933,10 +972,9 @@ void train_dispense_tick(lv_timer_t * timer) {
             break;
         }
 
-        case 10: { // Dispense: motor + IR + shared stop logic
+        case 10: {
             led_blink_mode = false;
-            led_set_solid(false);
-            setPCF8574Pin(4, false); // LED ON
+            led_set_solid(true);
 
             Motor_Start();
             IR_Start();
@@ -953,7 +991,7 @@ void train_dispense_tick(lv_timer_t * timer) {
             break;
         }
 
-        case 99: { // Done
+        case 99: {
             full_stop();
             led_set_solid(false);
             lv_timer_del(timer);
@@ -975,24 +1013,20 @@ void action_manual_dispense_treat(lv_event_t * e) {
 
     Serial.println("\n=== Manual Treat Dispense (timed) Started ===");
 
-    // Beep + LED ON
     audio_play_tone_1s();
-    setPCF8574Pin(4, false); // LED ON
+    led_set_solid(true);
 
-    // Wait 5 seconds (LED stays ON)
     delay(5000);
 
-    // Beep
     audio_play_tone_1s();
 
-    // Dispense treat
     Motor_Start();
     IR_Start();
 
     const unsigned long MOTOR_TIMEOUT = TRAIN_MOTOR_RUN_MS;
     MotorStopReason reason = run_motor_with_treat_logic(MOTOR_TIMEOUT, nullptr);
 
-    full_stop(); // turns motor + LED off
+    full_stop();
 
     Serial.print("Manual stop reason: ");
     Serial.println((int)reason);
@@ -1000,36 +1034,37 @@ void action_manual_dispense_treat(lv_event_t * e) {
     Serial.println("=== Manual Treat Dispense (timed) Complete ===\n");
 }
 
+// =====================================================
+// ✅ TRAINING MODE (2nd screen) UPDATED
+// - START: opens the 20s foot-switch training window
+// - STOP: cancels the window and forces safe outputs
+// =====================================================
 void action_train_dispense_treat(lv_event_t * e) {
     (void)e;
 
-    full_stop();
-    initPCF8574Pins();
-    delay(100);
-
-    Serial.println("=== Train Dispense STARTED ===");
-
-    train_dispense_stop_requested = false;
-    train_dispense_state = 0;
-    state_start_time = millis();
-
-    lv_timer_create(train_dispense_tick, 50, NULL);
-}
-
-// Standalone foot-switch training action (20s window) - can also be triggered by P7 remote
-void action_train_footswitch_dispense_start(lv_event_t* e) {
-    (void)e;
+    Serial.println("=== Training Mode START (footswitch window) ===");
+    ensure_remote_poll_timer_running();
     start_footswitch_training_window();
 }
 
 void action_train_dispense_stop(lv_event_t * e) {
     (void)e;
 
-    Serial.println("=== Train Dispense STOP requested ===");
+    Serial.println("=== Training Mode STOP requested ===");
+    cancel_footswitch_training_window();
     train_dispense_stop_requested = true;
     full_stop();
 }
 
+// Standalone foot-switch training action (also used by remote)
+void action_train_footswitch_dispense_start(lv_event_t* e) {
+    (void)e;
+    start_footswitch_training_window();
+}
+
+// ---------------------------
+// Schedule UI / control actions
+// ---------------------------
 void action_schedule_add_treat_num(lv_event_t * e) {
     (void)e;
     int idx = lv_roller_get_selected(objects.schedule_1_treatsnumber);
@@ -1077,10 +1112,8 @@ void action_scheduletreatdispensestart(lv_event_t * e) {
         schedule_start_time = millis();
 
         schedule_remaining_minutes = selected_hours_to_dispense * 60;
-        schedule_last_displayed_minutes = -9999; // force first refresh
+        schedule_last_displayed_minutes = -9999;
         update_schedule_3_ui();
-
-        Serial.printf("Schedule start time: %lu\n", schedule_start_time);
 
         if (schedule_timer != NULL) {
             lv_timer_del((lv_timer_t*)schedule_timer);

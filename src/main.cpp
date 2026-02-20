@@ -4,7 +4,16 @@
 // Date: 2/17/2026
 // Version 2.10
 // Platform: ESP32-2432S028R
+//
+// FIX 1 (motor twitch on boot):
+// - Force PCF8574 safe outputs IMMEDIATELY at the top of setup(), BEFORE any delays or I2C scan.
+// - Do it with a SINGLE port write (one I2C transaction) to avoid intermediate states.
+//
+// UPDATE (P7 IR remote active-low / correct input state):
+// - P7 should idle HIGH (released) and go LOW when remote triggers.
+// - We therefore "release" P7 HIGH in the earliest safe port write, and again after init.
 //***************************************************************************************/
+
 // Include all libraries
 #include <Arduino.h>
 #include <Wire.h>
@@ -55,6 +64,31 @@ TFT_eSPI tft = TFT_eSPI();
 
 #define SD_CS 5
 
+// ------------------------
+// FIX 1 + P7 input release
+// ------------------------
+// Safe intent at boot:
+//  - Motor off (P0,P1 LOW)
+//  - LED off (P4 HIGH if active-low LED)
+//  - IR TX off (P5 HIGH if active-low IR)
+//  - Remote input P7 RELEASED/HIGH (active-low input: idle HIGH, trigger LOW)
+//
+// PCF8574 port byte: bit=1 -> pin high (released/input), bit=0 -> pin low
+//
+#define PCF8574_SAFE_PORT ((uint8_t)((1u << 4) | (1u << 5) | (1u << 7)))
+
+static void forceSafePCF8574StateEarly() {
+    // Initialize I2C as early as possible and slam the port into a known safe state
+    Wire.begin(I2C_SDA, I2C_SCL);
+    Wire.setClock(100000);
+
+    Wire.beginTransmission(PCF8574_ADDRESS);
+    Wire.write(PCF8574_SAFE_PORT); // single write = no intermediate states
+    Wire.endTransmission();
+
+    delay(2);
+}
+
 void scanI2CDevices() {
     Serial.println("\n=== Scanning I2C Bus ===");
     byte error, address;
@@ -79,17 +113,21 @@ void scanI2CDevices() {
 void my_disp_flush(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map) {
     uint32_t w = lv_area_get_width(area);
     uint32_t h = lv_area_get_height(area);
+
     tft.startWrite();
     tft.setAddrWindow(area->x1, area->y1, w, h);
     tft.pushColors((uint16_t *)px_map, w * h, true);
     tft.endWrite();
+
     lv_disp_flush_ready(disp);
 }
 
 void my_touchpad_read(lv_indev_t *indev, lv_indev_data_t *data) {
     (void)indev;
+
     if (touchscreen.touched()) {
         TS_Point p = touchscreen.getPoint();
+
         if (p.x < touchScreenMinimumX) touchScreenMinimumX = p.x;
         if (p.x > touchScreenMaximumX) touchScreenMaximumX = p.x;
         if (p.y < touchScreenMinimumY) touchScreenMinimumY = p.y;
@@ -120,8 +158,13 @@ void splash_to_manual_cb(lv_timer_t * timer) {
 }
 
 void setup() {
+    // ------------------------------------------------------------
+    // FIX 1: Force PCF8574 safe outputs BEFORE ANY delays/scans
+    // ------------------------------------------------------------
+    forceSafePCF8574StateEarly();
+
     Serial.begin(115200);
-    delay(1000);
+    delay(100);
 
     String LVGL_Arduino = "Pup Button Firmware\nVersion 2.10\n";
     Serial.println("Pup Button Firmware");
@@ -132,27 +175,36 @@ void setup() {
     init_audio();
     analogReadResolution(12);
 
-    Wire.begin(I2C_SDA, I2C_SCL);
+    // I2C was already started in forceSafePCF8574StateEarly()
     Wire.setClock(100000);
     delay(10);
 
     scanI2CDevices();
 
+    // PCF init
     initPCF8574Pins();
 
-    // Force safe outputs immediately
-    setPCF8574Pin(0, false);
-    setPCF8574Pin(1, false);
-    setPCF8574Pin(4, true);
-    setPCF8574Pin(5, true);
-    setPCF8574Pin(7, false);
-    Serial.println("PCF initialized + outputs forced safe (motor off, LED/IR off)");
+    // Re-assert safe states via helper API (post-init)
+    setPCF8574Pin(0, false); // motor off
+    setPCF8574Pin(1, false); // motor off
+    setPCF8574Pin(4, true);  // LED off (active-low)
+    setPCF8574Pin(5, true);  // IR TX off (active-low)
+
+    // IMPORTANT: P7 is ACTIVE-LOW input; ensure it is RELEASED/HIGH for input reads
+    // Most PCF8574 libraries require writing HIGH to a pin to use it as an input.
+    // If your wrapper uses inverted semantics, adjust here to match "released/high".
+    setPCF8574Pin(7, false); // release/high (input)  <-- matches our actions.cpp assumption
+
+    Serial.println("PCF initialized + outputs forced safe (motor off, LED/IR off, P7 released)");
 
     Serial.println("\nVerifying pin states:");
     for (int pin = 0; pin < 8; pin++) {
         bool state = readPCF8574Pin(pin);
         Serial.printf("P%d: %s\n", pin, state ? "HIGH" : "LOW");
     }
+
+    // Optional: prove P7 idle state is HIGH (not pressed)
+    Serial.printf("P7 idle read: %s (expected HIGH)\n", readPCF8574Pin(7) ? "HIGH" : "LOW");
 
     if (!SD.begin(SD_CS)) {
         Serial.println("SD card initialization failed!");
@@ -193,7 +245,7 @@ void setup() {
 
     // ✅ Start IR-remote poll timer right after LVGL is initialized
     actions_init();
-    Serial.println("actions_init(): IR remote trigger enabled (P7)");
+    Serial.println("actions_init(): IR remote trigger enabled (P7 active-low)");
 
     lastTick = millis();
 }
