@@ -1,18 +1,15 @@
-// actions.cpp (clean, compile-safe version)
-//
+// actions.cpp
 //
 // IMPORTANT INTEGRATION NOTE:
 // - Call actions_init(); ONCE after LVGL + I2C/PCF are initialized.
 // - After that, the P7 remote trigger works even if scheduled mode is not running.
 //
 // Behaviors included:
-// 1) Manual treat mode sequence:
+// 1) Manual treat mode sequence (UPDATED):
 //      - LED ON (P4 active-low)
-//      - LED stays ON
-//      - Wait 5s
 //      - Beep 1s
 //      - Dispense treat (motor + IR + stop logic)
-//      - full_stop() at end
+//      - LED turns OFF after 5 seconds total-on-time (minimum)
 //
 // 2) Foot-switch training (standalone / “anytime”):
 //      - 20s window
@@ -23,8 +20,8 @@
 //      - If timeout -> no treat
 //      - Hardened against motor auto-start by forcing full_stop AFTER init + motor-off guard
 //
-// 3) Scheduled treat mode behavior:
-//      - Treat #1 follows the manual treat sequence (LED, wait 5s, beep, dispense)
+// 3) Scheduled treat mode behavior (UPDATED Treat #1):
+//      - Treat #1 follows the manual treat sequence (LED, beep, dispense, LED off after 5s total-on-time)
 //      - Treat #2..N require foot-switch activation (20s window). If not pressed -> skip treat.
 //
 // 4) IR remote trigger on PCF P7 (active-low):
@@ -573,18 +570,36 @@ void generate_schedule_times() {
 // Scheduled treat helpers
 // =====================================================
 
-// Treat #1: manual sequence, immediate
+// ---------------------------
+// NEW helpers: stop motor/IR without killing LED,
+// and enforce LED min-on-time (5s) for manual + schedule treat #1
+// ---------------------------
+static inline void motor_ir_stop_only() {
+    // Motor stop
+    setPCF8574Pin(PIN_MOTOR_IN1, false);
+    setPCF8574Pin(PIN_MOTOR_IN2, false);
+
+    // IR off (active-low)
+    setPCF8574Pin(PIN_IR_TX, true);
+}
+
+static inline void finish_with_led_min_on_time(unsigned long led_on_start_ms,
+                                               unsigned long min_on_ms = 5000UL) {
+    unsigned long elapsed = millis() - led_on_start_ms;
+    if (elapsed < min_on_ms) {
+        delay(min_on_ms - elapsed);
+    }
+    led_set_solid(false);
+}
+
+// Treat #1: manual sequence, immediate (UPDATED: LED off after 5s min-on-time)
 static bool schedule_dispense_manual_sequence_now(volatile bool* stop_flag) {
     Serial.println("Schedule treat #1: manual-sequence dispense");
 
-    // Beep + LED ON
-    //audio_play_tone_1s();
+    const unsigned long led_on_start = millis();
+
+    // LED ON + beep
     led_set_solid(true);
-
-    // Wait 5 seconds (LED stays ON)
-    delay(5000);
-
-    // Beep again
     audio_play_tone_1s();
 
     // Dispense
@@ -594,7 +609,9 @@ static bool schedule_dispense_manual_sequence_now(volatile bool* stop_flag) {
     const unsigned long MOTOR_TIMEOUT = TRAIN_MOTOR_RUN_MS;
     MotorStopReason reason = run_motor_with_treat_logic(MOTOR_TIMEOUT, stop_flag);
 
-    full_stop();
+    // Stop motor/IR now; keep LED on until 5s from led_on_start
+    motor_ir_stop_only();
+    finish_with_led_min_on_time(led_on_start, 5000UL);
 
     Serial.print("Schedule #1 stop reason: ");
     Serial.println((int)reason);
@@ -1006,32 +1023,34 @@ void train_dispense_tick(lv_timer_t * timer) {
 // Actions (LVGL events)
 // ---------------------------
 
-// Manual treat behavior:
-// Press button -> beep+LED ON -> wait 5s (LED stays on) -> beep -> dispense
+// Manual treat behavior (UPDATED):
+// Press button -> LED ON + beep -> dispense -> LED OFF after 5s total-on-time (minimum)
 void action_manual_dispense_treat(lv_event_t * e) {
     (void)e;
 
-    Serial.println("\n=== Manual Treat Dispense (timed) Started ===");
+    Serial.println("\n=== Manual Treat Dispense Started ===");
 
-    //audio_play_tone_1s();
+    const unsigned long led_on_start = millis();
+
+    // LED ON + beep
     led_set_solid(true);
-
-    delay(5000);
-
     audio_play_tone_1s();
 
+    // Dispense
     Motor_Start();
     IR_Start();
 
     const unsigned long MOTOR_TIMEOUT = TRAIN_MOTOR_RUN_MS;
     MotorStopReason reason = run_motor_with_treat_logic(MOTOR_TIMEOUT, nullptr);
 
-    full_stop();
+    // Stop motor/IR now; keep LED on until 5s from led_on_start
+    motor_ir_stop_only();
+    finish_with_led_min_on_time(led_on_start, 5000UL);
 
     Serial.print("Manual stop reason: ");
     Serial.println((int)reason);
 
-    Serial.println("=== Manual Treat Dispense (timed) Complete ===\n");
+    Serial.println("=== Manual Treat Dispense Complete ===\n");
 }
 
 // =====================================================
