@@ -7,7 +7,7 @@
 //
 // Behaviors included:
 // 1) Manual treat mode sequence:
-//      - Beep 1s + LED ON (P4 active-low)
+//      - LED ON (P4 active-low)
 //      - LED stays ON
 //      - Wait 5s
 //      - Beep 1s
