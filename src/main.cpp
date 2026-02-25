@@ -2,7 +2,7 @@
 // Pup Button 2026
 // Author: Nick Lewis
 // Date: 2/17/2026
-// Version 2.11
+// Version 2.12
 // Platform: ESP32-2432S028R
 //
 // FIX 1 (motor twitch on boot):
@@ -166,9 +166,9 @@ void setup() {
     Serial.begin(115200);
     delay(100);
 
-    String LVGL_Arduino = "Pup Button Firmware\nVersion 2.11\n";
+    String LVGL_Arduino = "Pup Button Firmware\nVersion 2.12\n";
     Serial.println("Pup Button Firmware");
-    Serial.println("Version 2.11");
+    Serial.println("Version 2.12");
     LVGL_Arduino += String('V') + lv_version_major() + "." + lv_version_minor() + "." + lv_version_patch();
     Serial.println(LVGL_Arduino);
 
