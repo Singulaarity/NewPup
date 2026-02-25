@@ -578,7 +578,7 @@ static bool schedule_dispense_manual_sequence_now(volatile bool* stop_flag) {
     Serial.println("Schedule treat #1: manual-sequence dispense");
 
     // Beep + LED ON
-    audio_play_tone_1s();
+    //audio_play_tone_1s();
     led_set_solid(true);
 
     // Wait 5 seconds (LED stays ON)
