@@ -24,7 +24,7 @@
 //      - Hardened against motor auto-start by forcing full_stop AFTER init + motor-off guard
 //
 // 3) Scheduled treat mode behavior:
-//      - Treat #1 follows the manual treat sequence (beep+LED, wait 5s, beep, dispense)
+//      - Treat #1 follows the manual treat sequence (LED, wait 5s, beep, dispense)
 //      - Treat #2..N require foot-switch activation (20s window). If not pressed -> skip treat.
 //
 // 4) IR remote trigger on PCF P7 (active-low):
@@ -1013,7 +1013,7 @@ void action_manual_dispense_treat(lv_event_t * e) {
 
     Serial.println("\n=== Manual Treat Dispense (timed) Started ===");
 
-    audio_play_tone_1s();
+    //audio_play_tone_1s();
     led_set_solid(true);
 
     delay(5000);
