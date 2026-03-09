@@ -37,6 +37,13 @@
 //
 // 6) Serial summary includes motion + current info to help tuning.
 //
+// 7) Terminal jam alert:
+//      - If motor cannot unjam after all retries, a high-pitched warning tone beeps 5 times.
+//
+// 8) Timeout behavior:
+//      - Reverse/unjam time does NOT count toward motor timeout
+//      - Allows job to actually reach STOP_JAM after exhausting retries
+//
 
 #include <Arduino.h>
 #include <stdlib.h>
@@ -98,6 +105,26 @@
 
 #ifndef WAV_FILE
 #define WAV_FILE "/treat.wav"
+#endif
+
+#ifndef JAM_WARNING_BEEP_COUNT
+#define JAM_WARNING_BEEP_COUNT 5
+#endif
+
+#ifndef JAM_WARNING_FREQ_HZ
+#define JAM_WARNING_FREQ_HZ 2400U
+#endif
+
+#ifndef JAM_WARNING_BEEP_ON_MS
+#define JAM_WARNING_BEEP_ON_MS 120UL
+#endif
+
+#ifndef JAM_WARNING_BEEP_OFF_MS
+#define JAM_WARNING_BEEP_OFF_MS 90UL
+#endif
+
+#ifndef JAM_WARNING_DAC_AMPLITUDE
+#define JAM_WARNING_DAC_AMPLITUDE 220U
 #endif
 
 // -----------------------------
@@ -194,7 +221,10 @@ extern float ZERO_CURRENT_VOLTAGE;
 // ---------------------------
 static inline bool every_30s(unsigned long now_ms) {
     static unsigned long last = 0;
-    if (now_ms - last >= 30000UL) { last = now_ms; return true; }
+    if (now_ms - last >= 30000UL) {
+        last = now_ms;
+        return true;
+    }
     return false;
 }
 
@@ -325,7 +355,10 @@ static inline bool footswitch_pressed_debounced(unsigned long now_ms) {
     bool raw = !readPCF8574Pin(PIN_FOOTSWITCH); // active-low
     static bool prev = false;
     static unsigned long t = 0;
-    if (raw != prev) { prev = raw; t = now_ms; }
+    if (raw != prev) {
+        prev = raw;
+        t = now_ms;
+    }
     return raw && (now_ms - t > 30UL);
 }
 
@@ -355,6 +388,9 @@ struct AsyncMotorJob {
     unsigned long led_on_start_ms = 0;
     unsigned long led_min_on_ms = 0;
     unsigned long ir_valid_after_ms = 0;
+
+    // Reverse/unjam time accumulated here is excluded from timeout.
+    unsigned long paused_for_reverse_ms = 0;
 
     volatile bool* external_stop_flag = nullptr;
     MotorJobDoneCb done_cb = nullptr;
@@ -413,6 +449,11 @@ static void ensure_remote_poll_timer_running();
 static void cancel_footswitch_training_window();
 static void start_footswitch_training_window();
 static void start_unjam_reverse(unsigned long now, const char* cause);
+static void play_jam_warning_5x();
+static void play_jam_warning_if_needed(MotorStopReason reason);
+static void play_square_tone_blocking(uint16_t freq_hz,
+                                      uint8_t amplitude,
+                                      unsigned long duration_ms);
 
 // ---------------------------
 // Button helpers
@@ -421,7 +462,10 @@ static inline bool button_pressed_debounced(unsigned long now_ms) {
     bool raw = !readPCF8574Pin(PIN_BUTTON);
     static bool prev = false;
     static unsigned long t = 0;
-    if (raw != prev) { prev = raw; t = now_ms; }
+    if (raw != prev) {
+        prev = raw;
+        t = now_ms;
+    }
     return raw && (now_ms - t > 30UL);
 }
 
@@ -515,6 +559,7 @@ static void start_async_motor_job(unsigned long timeout_ms,
     g_motor_job.led_on_start_ms = led_on_start_ms;
     g_motor_job.led_min_on_ms = led_min_on_ms;
     g_motor_job.ir_valid_after_ms = now + IR_SETTLE_MS;
+    g_motor_job.paused_for_reverse_ms = 0;
     g_motor_job.external_stop_flag = external_stop_flag;
     g_motor_job.done_cb = done_cb;
     g_motor_job.final_reason = STOP_TIMEOUT;
@@ -551,8 +596,15 @@ static void motor_job_finish(MotorStopReason reason) {
     g_motor_job.active = false;
     g_motor_job.reverse_active = false;
 
+    const unsigned long now = millis();
+    const unsigned long total_elapsed_ms = now - g_motor_job.start_ms;
+    const unsigned long effective_elapsed_ms =
+        (total_elapsed_ms >= g_motor_job.paused_for_reverse_ms)
+            ? (total_elapsed_ms - g_motor_job.paused_for_reverse_ms)
+            : 0;
+
     Serial.printf(
-        "RUN SUMMARY: peak=%.2fA filtered=%.2fA inst=%.2fA zero=%.3fV retries=%d reason=%d transitions=%d treat=%d sawMotion=%d noMotionMs=%lu\r\n",
+        "RUN SUMMARY: peak=%.2fA filtered=%.2fA inst=%.2fA zero=%.3fV retries=%d reason=%d transitions=%d treat=%d sawMotion=%d noMotionMs=%lu runMs=%lu reverseMs=%lu\r\n",
         g_motor_job.peak_current_amps,
         g_motor_job.filtered_current_amps,
         g_motor_job.inst_current_amps,
@@ -562,7 +614,9 @@ static void motor_job_finish(MotorStopReason reason) {
         g_motor_job.lhTransitions,
         g_motor_job.treatDispensed ? 1 : 0,
         g_motor_job.saw_motion_this_run ? 1 : 0,
-        (unsigned long)(millis() - g_motor_job.last_motion_ms)
+        (unsigned long)(now - g_motor_job.last_motion_ms),
+        effective_elapsed_ms,
+        g_motor_job.paused_for_reverse_ms
     );
 
     if (g_motor_job.done_cb) {
@@ -614,15 +668,12 @@ static void motor_job_tick(lv_timer_t* timer) {
         return;
     }
 
-    if ((now - g_motor_job.start_ms) >= g_motor_job.timeout_ms) {
-        Serial.println("Motor timeout reached.");
-        motor_job_finish(STOP_TIMEOUT);
-        return;
-    }
-
     // If reversing to unjam, hold reverse for a fixed interval, then resume forward.
+    // IMPORTANT: reverse time does NOT count toward timeout.
     if (g_motor_job.reverse_active) {
         if ((now - g_motor_job.reverse_start_ms) >= MOTOR_UNJAM_REVERSE_MS) {
+            g_motor_job.paused_for_reverse_ms += (now - g_motor_job.reverse_start_ms);
+
             g_motor_job.reverse_active = false;
             g_motor_job.jam_rearm_after_ms = now + MOTOR_JAM_REARM_MS;
             g_motor_job.motion_arm_after_ms = now + JAM_NO_MOTION_STARTUP_MS;
@@ -637,6 +688,23 @@ static void motor_job_tick(lv_timer_t* timer) {
                           g_motor_job.jam_retries, MOTOR_MAX_UNJAM_RETRIES);
         }
         return;
+    }
+
+    // Timeout applies only to forward-running time, not reverse/unjam time.
+    {
+        const unsigned long total_elapsed_ms = now - g_motor_job.start_ms;
+        const unsigned long effective_elapsed_ms =
+            (total_elapsed_ms >= g_motor_job.paused_for_reverse_ms)
+                ? (total_elapsed_ms - g_motor_job.paused_for_reverse_ms)
+                : 0;
+
+        if (effective_elapsed_ms >= g_motor_job.timeout_ms) {
+            Serial.printf("Motor timeout reached. effectiveRun=%lu ms reversePaused=%lu ms\r\n",
+                          effective_elapsed_ms,
+                          g_motor_job.paused_for_reverse_ms);
+            motor_job_finish(STOP_TIMEOUT);
+            return;
+        }
     }
 
     // Current monitoring while motor runs (averaged ADC)
@@ -994,12 +1062,14 @@ static MotorStopReason legacy_train_reason = STOP_TIMEOUT;
 
 static void training_motor_done_cb(MotorStopReason reason) {
     full_stop();
+    play_jam_warning_if_needed(reason);
     Serial.print("Foot-switch dispense stop reason: ");
     Serial.println((int)reason);
 }
 
 static void manual_dispense_done_cb(MotorStopReason reason) {
     stop_motor_ir_and_hold_led_if_needed(g_motor_job.led_on_start_ms, 5000UL);
+    play_jam_warning_if_needed(reason);
     Serial.print("Manual stop reason: ");
     Serial.println((int)reason);
     Serial.println("=== Manual Treat Dispense Complete ===\n");
@@ -1007,6 +1077,7 @@ static void manual_dispense_done_cb(MotorStopReason reason) {
 
 static void schedule_treat1_done_cb(MotorStopReason reason) {
     stop_motor_ir_and_hold_led_if_needed(g_motor_job.led_on_start_ms, 5000UL);
+    play_jam_warning_if_needed(reason);
 
     Serial.print("Schedule #1 stop reason: ");
     Serial.println((int)reason);
@@ -1023,6 +1094,7 @@ static void schedule_treat1_done_cb(MotorStopReason reason) {
 
 static void schedule_footswitch_done_cb(MotorStopReason reason) {
     full_stop();
+    play_jam_warning_if_needed(reason);
 
     Serial.print("Schedule foot-switch stop reason: ");
     Serial.println((int)reason);
@@ -1040,6 +1112,7 @@ static void schedule_footswitch_done_cb(MotorStopReason reason) {
 
 static void legacy_train_done_cb(MotorStopReason reason) {
     full_stop();
+    play_jam_warning_if_needed(reason);
     legacy_train_reason = reason;
     legacy_train_job_done = true;
 }
@@ -1205,6 +1278,52 @@ static void schedule_timer_tick(lv_timer_t * timer) {
                 dispense_in_progress = false;
             }
         }
+    }
+}
+
+// ---------------------------
+// Jam warning tone
+// High-pitched blocking 5-beep alert used only on terminal jam.
+// ---------------------------
+static void play_square_tone_blocking(uint16_t freq_hz,
+                                      uint8_t amplitude,
+                                      unsigned long duration_ms) {
+    if (freq_hz == 0 || duration_ms == 0) return;
+
+    dac_output_enable(DAC_CHANNEL_2);
+
+    const unsigned long half_period_us = 1000000UL / ((unsigned long)freq_hz * 2UL);
+    const unsigned long total_cycles = ((unsigned long)freq_hz * duration_ms) / 1000UL;
+
+    for (unsigned long i = 0; i < total_cycles; ++i) {
+        dac_output_voltage(DAC_CHANNEL_2, amplitude);
+        delayMicroseconds(half_period_us);
+        dac_output_voltage(DAC_CHANNEL_2, 0);
+        delayMicroseconds(half_period_us);
+    }
+
+    dac_output_voltage(DAC_CHANNEL_2, 0);
+}
+
+static void play_jam_warning_5x() {
+    Serial.println("Playing terminal JAM warning tone (5 beeps).");
+
+    for (int i = 0; i < JAM_WARNING_BEEP_COUNT; ++i) {
+        play_square_tone_blocking((uint16_t)JAM_WARNING_FREQ_HZ,
+                                  (uint8_t)JAM_WARNING_DAC_AMPLITUDE,
+                                  JAM_WARNING_BEEP_ON_MS);
+
+        if (i < (JAM_WARNING_BEEP_COUNT - 1)) {
+            delay(JAM_WARNING_BEEP_OFF_MS);
+        }
+    }
+
+    dac_output_voltage(DAC_CHANNEL_2, 0);
+}
+
+static void play_jam_warning_if_needed(MotorStopReason reason) {
+    if (reason == STOP_JAM) {
+        play_jam_warning_5x();
     }
 }
 
@@ -1440,7 +1559,7 @@ static void train_dispense_tick(lv_timer_t * timer) {
 extern "C" void actions_init() {
     Wire.setClock(400000);
     ensure_remote_poll_timer_running();
-    Serial.printf("Current config: ZERO=%.3fV SENS=%.3fV/A AVG=%d FILTER_ALPHA=%.2f NO_MOTION_START=%lu NO_MOTION_TIMEOUT=%lu IFILT_JAM=%.2f IFILT_CONFIRM=%lu\r\n",
+    Serial.printf("Current config: ZERO=%.3fV SENS=%.3fV/A AVG=%d FILTER_ALPHA=%.2f NO_MOTION_START=%lu NO_MOTION_TIMEOUT=%lu IFILT_JAM=%.2f IFILT_CONFIRM=%lu JAM_BEEPS=%d JAM_FREQ=%u\r\n",
                   ZERO_CURRENT_VOLTAGE,
                   SENSITIVITY,
                   (int)CURRENT_SENSOR_AVG_SAMPLES,
@@ -1448,7 +1567,9 @@ extern "C" void actions_init() {
                   (unsigned long)JAM_NO_MOTION_STARTUP_MS,
                   (unsigned long)JAM_NO_MOTION_TIMEOUT_MS,
                   (float)JAM_FILTERED_THRESHOLD_AMPS,
-                  (unsigned long)JAM_FILTERED_CONFIRM_MS);
+                  (unsigned long)JAM_FILTERED_CONFIRM_MS,
+                  (int)JAM_WARNING_BEEP_COUNT,
+                  (unsigned int)JAM_WARNING_FREQ_HZ);
 }
 
 // Manual treat behavior
