@@ -29,18 +29,13 @@
 // 4) IR remote trigger on PCF P7 (active-low):
 //      - Debounced edge on P7 starts the standalone foot-switch training window at ANY time
 //      - Implemented via LVGL timer polling P7
-//      - Polling rate increased for better reliability
 //
-// 5) Motor current / jam behavior tuned for ACS712-30A + L298N supply-side sensing:
-//      - ADC readings are averaged using CURRENT_SENSOR_AVG_SAMPLES
-//      - Serial streams instantaneous current, filtered current, and peak current
-//      - Jam detection uses FILTERED current with consecutive-hit confirmation
-//      - Peak current is tracked for debug because PWM + H-bridge can hide true spikes
+// 5) Jam detection uses TWO paths:
+//      A) PRIMARY: rotary no-motion jam detection
+//      B) SECONDARY: elevated filtered current jam detection
+//      - Hard jam threshold path removed
 //
-// 6) Serial current telemetry:
-//      - Streams every motor tick while motor runs forward
-//      - Includes averaged ADC raw, voltage, delta from zero, instantaneous current,
-//        filtered current, peak current, threshold, reverse state, and retry count
+// 6) Serial summary includes motion + current info to help tuning.
 //
 
 #include <Arduino.h>
@@ -137,18 +132,31 @@
 #define MOTOR_JAM_REARM_MS 150UL
 #endif
 
-// Jam detection tuned for PWM/H-bridge averaged current.
-// Use filtered current and require several consecutive hits.
-#ifndef JAM_THRESHOLD_AMPS
-#define JAM_THRESHOLD_AMPS 0.1f
-#endif
-
-#ifndef JAM_CONSECUTIVE_HITS_REQUIRED
-#define JAM_CONSECUTIVE_HITS_REQUIRED 4
-#endif
-
 #ifndef CURRENT_FILTER_ALPHA
-#define CURRENT_FILTER_ALPHA 0.30f
+#define CURRENT_FILTER_ALPHA 0.20f
+#endif
+
+// -----------------------------
+// Primary jam detection: rotary no-motion
+// -----------------------------
+#ifndef JAM_NO_MOTION_STARTUP_MS
+#define JAM_NO_MOTION_STARTUP_MS 400UL
+#endif
+
+#ifndef JAM_NO_MOTION_TIMEOUT_MS
+#define JAM_NO_MOTION_TIMEOUT_MS 1500UL
+#endif
+
+// -----------------------------
+// Secondary jam detection: filtered current
+// Tuned conservatively to avoid normal-start false positives.
+// -----------------------------
+#ifndef JAM_FILTERED_THRESHOLD_AMPS
+#define JAM_FILTERED_THRESHOLD_AMPS 0.85f
+#endif
+
+#ifndef JAM_FILTERED_CONFIRM_MS
+#define JAM_FILTERED_CONFIRM_MS 250UL
 #endif
 
 // Must be defined in main.cpp and calibrated there.
@@ -368,7 +376,14 @@ struct AsyncMotorJob {
     float last_voltage = 0.0f;
     float last_delta_v = 0.0f;
     int   last_adc = 0;
-    int   jam_consecutive_hits = 0;
+
+    // Motion / no-motion jam detection
+    unsigned long last_motion_ms = 0;
+    unsigned long motion_arm_after_ms = 0;
+    bool saw_motion_this_run = false;
+
+    // Filtered current jam detection
+    unsigned long filtered_jam_start_ms = 0;
 
     // Unjam / reverse state
     bool reverse_active = false;
@@ -397,6 +412,7 @@ static void remote_poll_tick(lv_timer_t* t);
 static void ensure_remote_poll_timer_running();
 static void cancel_footswitch_training_window();
 static void start_footswitch_training_window();
+static void start_unjam_reverse(unsigned long now, const char* cause);
 
 // ---------------------------
 // Button helpers
@@ -464,7 +480,12 @@ static void motor_job_reset_treat_logic() {
     g_motor_job.last_voltage = 0.0f;
     g_motor_job.last_delta_v = 0.0f;
     g_motor_job.last_adc = 0;
-    g_motor_job.jam_consecutive_hits = 0;
+
+    g_motor_job.last_motion_ms = millis();
+    g_motor_job.motion_arm_after_ms = g_motor_job.last_motion_ms + JAM_NO_MOTION_STARTUP_MS;
+    g_motor_job.saw_motion_this_run = false;
+
+    g_motor_job.filtered_jam_start_ms = 0;
 
     // legacy mirrors for compatibility/debug
     treatDispensed = false;
@@ -485,13 +506,15 @@ static void start_async_motor_job(unsigned long timeout_ms,
         return;
     }
 
+    const unsigned long now = millis();
+
     g_motor_job.active = true;
     g_motor_job.ir_started = false;
-    g_motor_job.start_ms = millis();
+    g_motor_job.start_ms = now;
     g_motor_job.timeout_ms = timeout_ms;
     g_motor_job.led_on_start_ms = led_on_start_ms;
     g_motor_job.led_min_on_ms = led_min_on_ms;
-    g_motor_job.ir_valid_after_ms = millis() + IR_SETTLE_MS;
+    g_motor_job.ir_valid_after_ms = now + IR_SETTLE_MS;
     g_motor_job.external_stop_flag = external_stop_flag;
     g_motor_job.done_cb = done_cb;
     g_motor_job.final_reason = STOP_TIMEOUT;
@@ -528,15 +551,18 @@ static void motor_job_finish(MotorStopReason reason) {
     g_motor_job.active = false;
     g_motor_job.reverse_active = false;
 
-    // ---- ONLY SERIAL PRINT LEFT ----
     Serial.printf(
-        "RUN SUMMARY: peak=%.2fA filtered=%.2fA inst=%.2fA zero=%.3fV retries=%d reason=%d\r\n",
+        "RUN SUMMARY: peak=%.2fA filtered=%.2fA inst=%.2fA zero=%.3fV retries=%d reason=%d transitions=%d treat=%d sawMotion=%d noMotionMs=%lu\r\n",
         g_motor_job.peak_current_amps,
         g_motor_job.filtered_current_amps,
         g_motor_job.inst_current_amps,
         ZERO_CURRENT_VOLTAGE,
         g_motor_job.jam_retries,
-        (int)reason
+        (int)reason,
+        g_motor_job.lhTransitions,
+        g_motor_job.treatDispensed ? 1 : 0,
+        g_motor_job.saw_motion_this_run ? 1 : 0,
+        (unsigned long)(millis() - g_motor_job.last_motion_ms)
     );
 
     if (g_motor_job.done_cb) {
@@ -544,6 +570,30 @@ static void motor_job_finish(MotorStopReason reason) {
         g_motor_job.done_cb = nullptr;
         cb(reason);
     }
+}
+
+static void start_unjam_reverse(unsigned long now, const char* cause) {
+    g_motor_job.jam_retries++;
+    g_motor_job.filtered_jam_start_ms = 0;
+
+    Serial.printf("JAM detected by %s -> retry %d/%d\r\n",
+                  cause,
+                  g_motor_job.jam_retries,
+                  MOTOR_MAX_UNJAM_RETRIES);
+
+    if (g_motor_job.jam_retries > MOTOR_MAX_UNJAM_RETRIES) {
+        Serial.println("Max unjam retries exceeded. Stopping motor job as JAM.");
+        motor_job_finish(STOP_JAM);
+        return;
+    }
+
+    setPCF8574Pin(PIN_MOTOR_IN1, false);
+    setPCF8574Pin(PIN_MOTOR_IN2, true);
+    Serial.println("Motor ON (CCW / unjam)");
+
+    g_motor_job.reverse_active = true;
+    g_motor_job.reverse_start_ms = now;
+    g_motor_job.last_motion_ms = now;
 }
 
 static void motor_job_tick(lv_timer_t* timer) {
@@ -575,7 +625,10 @@ static void motor_job_tick(lv_timer_t* timer) {
         if ((now - g_motor_job.reverse_start_ms) >= MOTOR_UNJAM_REVERSE_MS) {
             g_motor_job.reverse_active = false;
             g_motor_job.jam_rearm_after_ms = now + MOTOR_JAM_REARM_MS;
-            g_motor_job.jam_consecutive_hits = 0;
+            g_motor_job.motion_arm_after_ms = now + JAM_NO_MOTION_STARTUP_MS;
+            g_motor_job.filtered_jam_start_ms = 0;
+            g_motor_job.last_motion_ms = now;
+            g_motor_job.saw_motion_this_run = false;
 
             Motor_Start();
             g_motor_job.ir_valid_after_ms = now + IR_SETTLE_MS;
@@ -609,43 +662,7 @@ static void motor_job_tick(lv_timer_t* timer) {
     g_motor_job.last_delta_v = delta_v;
     g_motor_job.last_adc = adcValue;
 
-        // Jam detection: use filtered current and require consecutive hits
-    if (now >= g_motor_job.jam_rearm_after_ms) {
-        if (g_motor_job.filtered_current_amps > JAM_THRESHOLD_AMPS) {
-            g_motor_job.jam_consecutive_hits++;
-        } else {
-            g_motor_job.jam_consecutive_hits = 0;
-        }
-
-        if (g_motor_job.jam_consecutive_hits >= JAM_CONSECUTIVE_HITS_REQUIRED) {
-            g_motor_job.jam_retries++;
-            g_motor_job.jam_consecutive_hits = 0;
-
-            Serial.printf("STALL/JAM detected! I=%.2fA Ifilt=%.2fA Ipeak=%.2fA retry %d/%d\r\n",
-                          g_motor_job.inst_current_amps,
-                          g_motor_job.filtered_current_amps,
-                          g_motor_job.peak_current_amps,
-                          g_motor_job.jam_retries,
-                          MOTOR_MAX_UNJAM_RETRIES);
-
-            if (g_motor_job.jam_retries > MOTOR_MAX_UNJAM_RETRIES) {
-                Serial.println("Max unjam retries exceeded. Stopping motor job as JAM.");
-                motor_job_finish(STOP_JAM);
-                return;
-            }
-
-            // Reverse briefly to unbind the mechanism
-            setPCF8574Pin(PIN_MOTOR_IN1, false);
-            setPCF8574Pin(PIN_MOTOR_IN2, true);
-            Serial.println("Motor ON (CCW / unjam)");
-
-            g_motor_job.reverse_active = true;
-            g_motor_job.reverse_start_ms = now;
-            return;
-        }
-    }
-
-    // Wait for IR settle before evaluating beam
+    // Wait for IR settle before evaluating beam or rotary-based logic
     if (now < g_motor_job.ir_valid_after_ms) {
         return;
     }
@@ -653,6 +670,67 @@ static void motor_job_tick(lv_timer_t* timer) {
     bool rawValue     = readPCF8574Pin(PIN_IR_RX);   // HIGH=intact, LOW=broken
     bool rotarySwitch = readPCF8574Pin(PIN_ROTARY);  // HIGH=safe-to-stop
     bool beamBroken   = !rawValue;
+
+    // Rotary motion detection
+    if (rotarySwitch != g_motor_job.lastRotary) {
+        g_motor_job.last_motion_ms = now;
+        g_motor_job.saw_motion_this_run = true;
+    }
+
+    // ---------------------------------------------
+    // JAM PATH A: PRIMARY - no rotary movement
+    // Does NOT require current threshold.
+    // ---------------------------------------------
+    if (now >= g_motor_job.jam_rearm_after_ms &&
+        now >= g_motor_job.motion_arm_after_ms &&
+        !g_motor_job.treatDispensed) {
+
+        const bool no_motion_too_long =
+            ((now - g_motor_job.last_motion_ms) >= JAM_NO_MOTION_TIMEOUT_MS);
+
+        if (no_motion_too_long) {
+            Serial.printf("NO-MOTION JAM detected! noMotion=%lums I=%.2fA Ifilt=%.2fA Ipeak=%.2fA\r\n",
+                          (unsigned long)(now - g_motor_job.last_motion_ms),
+                          g_motor_job.inst_current_amps,
+                          g_motor_job.filtered_current_amps,
+                          g_motor_job.peak_current_amps);
+            start_unjam_reverse(now, "NO_MOTION");
+            return;
+        }
+    }
+
+    // ---------------------------------------------
+    // JAM PATH B: SECONDARY - elevated filtered current
+    // Runs after rotary no-motion logic and uses startup blanking.
+    // ---------------------------------------------
+    if (now >= g_motor_job.jam_rearm_after_ms &&
+        now >= g_motor_job.motion_arm_after_ms) {
+
+        const bool filtered_over =
+            (g_motor_job.filtered_current_amps >= JAM_FILTERED_THRESHOLD_AMPS);
+
+        if (filtered_over) {
+            if (g_motor_job.filtered_jam_start_ms == 0) {
+                g_motor_job.filtered_jam_start_ms = now;
+            }
+        } else {
+            g_motor_job.filtered_jam_start_ms = 0;
+        }
+
+        const bool filtered_jam_confirmed =
+            (g_motor_job.filtered_jam_start_ms != 0) &&
+            ((now - g_motor_job.filtered_jam_start_ms) >= JAM_FILTERED_CONFIRM_MS);
+
+        if (filtered_jam_confirmed) {
+            Serial.printf("FILTERED-CURRENT JAM detected! Ifilt=%.2fA I=%.2fA Ipeak=%.2fA overFor=%lums\r\n",
+                          g_motor_job.filtered_current_amps,
+                          g_motor_job.inst_current_amps,
+                          g_motor_job.peak_current_amps,
+                          (unsigned long)(now - g_motor_job.filtered_jam_start_ms));
+            start_unjam_reverse(now, "FILTERED_CURRENT");
+            return;
+        }
+    }
 
     if (!g_motor_job.treatDispensed && beamBroken) {
         g_motor_job.treatDispensed = true;
@@ -1362,12 +1440,15 @@ static void train_dispense_tick(lv_timer_t * timer) {
 extern "C" void actions_init() {
     Wire.setClock(400000);
     ensure_remote_poll_timer_running();
-    Serial.printf("Current config: ZERO=%.3fV SENS=%.3fV/A AVG=%d JAM=%.2fA FILTER_ALPHA=%.2f\r\n",
+    Serial.printf("Current config: ZERO=%.3fV SENS=%.3fV/A AVG=%d FILTER_ALPHA=%.2f NO_MOTION_START=%lu NO_MOTION_TIMEOUT=%lu IFILT_JAM=%.2f IFILT_CONFIRM=%lu\r\n",
                   ZERO_CURRENT_VOLTAGE,
                   SENSITIVITY,
                   (int)CURRENT_SENSOR_AVG_SAMPLES,
-                  (float)JAM_THRESHOLD_AMPS,
-                  (float)CURRENT_FILTER_ALPHA);
+                  (float)CURRENT_FILTER_ALPHA,
+                  (unsigned long)JAM_NO_MOTION_STARTUP_MS,
+                  (unsigned long)JAM_NO_MOTION_TIMEOUT_MS,
+                  (float)JAM_FILTERED_THRESHOLD_AMPS,
+                  (unsigned long)JAM_FILTERED_CONFIRM_MS);
 }
 
 // Manual treat behavior
