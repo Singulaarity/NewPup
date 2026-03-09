@@ -51,6 +51,7 @@ uint16_t touchScreenMinimumY = 240, touchScreenMaximumY = 3800;
 lv_indev_t *indev;
 uint8_t *draw_buf;
 uint32_t lastTick = 0;
+float ZERO_CURRENT_VOLTAGE = 2.50f;
 
 TFT_eSPI tft = TFT_eSPI();
 
@@ -246,6 +247,24 @@ void setup() {
     // ✅ Start IR-remote poll timer right after LVGL is initialized
     actions_init();
     Serial.println("actions_init(): IR remote trigger enabled (P7 active-low)");
+
+    float sum = 0;
+
+for(int i=0;i<10;i++){
+    int a = analogRead(35);
+    float v = (a / 4095.0f) * 3.3f;
+
+    sum += v;
+
+    float current = fabs((v - ZERO_CURRENT_VOLTAGE) / 0.066f);
+
+    Serial.printf("InitCurrent[%d]=%.3fA (ADC=%d V=%.3f)\n", i, current, a, v);
+    delay(20);
+    }
+
+    ZERO_CURRENT_VOLTAGE = sum / 10.0f;
+
+    Serial.printf("Calibrated ZERO_CURRENT_VOLTAGE = %.4f V\n", ZERO_CURRENT_VOLTAGE);
 
     lastTick = millis();
 }

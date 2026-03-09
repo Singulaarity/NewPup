@@ -1,12 +1,14 @@
 #ifndef ACTIONS_H
 #define ACTIONS_H
 
+
 #include "lvgl.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
+extern float ZERO_CURRENT_VOLTAGE;
 void actions_init(void);
 void init_audio(void);
 void setPCF8574Pin(uint8_t pin, bool state);

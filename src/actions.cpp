@@ -2,6 +2,9 @@
 //
 // IMPORTANT INTEGRATION NOTE:
 // - Call actions_init(); ONCE after LVGL + I2C/PCF are initialized.
+// - main.cpp should define the calibrated zero-current variable, e.g.:
+//       float ZERO_CURRENT_VOLTAGE = 2.50f;
+//   and calibrate it at startup before motor use.
 // - After that, the P7 remote trigger works even if scheduled mode is not running.
 //
 // Behaviors included:
@@ -26,17 +29,18 @@
 // 4) IR remote trigger on PCF P7 (active-low):
 //      - Debounced edge on P7 starts the standalone foot-switch training window at ANY time
 //      - Implemented via LVGL timer polling P7
+//      - Polling rate increased for better reliability
 //
-// 5) Motor stall / unjam behavior:
-//      - While motor is running, current is monitored continuously
+// 5) Motor current / jam behavior tuned for ACS712-30A + L298N supply-side sensing:
 //      - ADC readings are averaged using CURRENT_SENSOR_AVG_SAMPLES
-//      - If current exceeds JAM_THRESHOLD_AMPS, motor reverses for MOTOR_UNJAM_REVERSE_MS
-//      - Then motor resumes forward operation
-//      - Retries are limited by MOTOR_MAX_UNJAM_RETRIES
+//      - Serial streams instantaneous current, filtered current, and peak current
+//      - Jam detection uses FILTERED current with consecutive-hit confirmation
+//      - Peak current is tracked for debug because PWM + H-bridge can hide true spikes
 //
 // 6) Serial current telemetry:
-//      - While motor is running forward, current prints every 250 ms
-//      - Includes averaged ADC raw, sensor voltage, calculated current, threshold, reverse state, and retry count
+//      - Streams every motor tick while motor runs forward
+//      - Includes averaged ADC raw, voltage, delta from zero, instantaneous current,
+//        filtered current, peak current, threshold, reverse state, and retry count
 //
 
 #include <Arduino.h>
@@ -101,44 +105,24 @@
 #define WAV_FILE "/treat.wav"
 #endif
 
+// -----------------------------
+// Motor Current Sense
+// -----------------------------
 #ifndef CURRENT_SENSOR_PIN
 #define CURRENT_SENSOR_PIN 35
-#endif
-
-#ifndef ZERO_CURRENT_VOLTAGE
-#define ZERO_CURRENT_VOLTAGE 2.50f
-#endif
-
-#ifndef SENSITIVITY
-#define SENSITIVITY 0.185f
-#endif
-
-#ifndef JAM_THRESHOLD_AMPS
-#define JAM_THRESHOLD_AMPS 5.5f
-#endif
-
-#ifndef TRAIN_MOTOR_RUN_MS
-#define TRAIN_MOTOR_RUN_MS 8000UL
 #endif
 
 #ifndef CURRENT_SENSOR_ADC_FS_VOLTS
 #define CURRENT_SENSOR_ADC_FS_VOLTS 3.3f
 #endif
 
+// ACS712-30A = 66 mV/A
+#ifndef SENSITIVITY
+#define SENSITIVITY 0.066f
+#endif
+
 #ifndef CURRENT_SENSOR_AVG_SAMPLES
-#define CURRENT_SENSOR_AVG_SAMPLES 8
-#endif
-
-#ifndef MOTOR_JOB_TICK_MS
-#define MOTOR_JOB_TICK_MS 5
-#endif
-
-#ifndef IR_SETTLE_MS
-#define IR_SETTLE_MS 150UL
-#endif
-
-#ifndef TRAINING_ARM_MS
-#define TRAINING_ARM_MS 50UL
+#define CURRENT_SENSOR_AVG_SAMPLES 4
 #endif
 
 #ifndef MOTOR_UNJAM_REVERSE_MS
@@ -151,6 +135,50 @@
 
 #ifndef MOTOR_JAM_REARM_MS
 #define MOTOR_JAM_REARM_MS 150UL
+#endif
+
+// Jam detection tuned for PWM/H-bridge averaged current.
+// Use filtered current and require several consecutive hits.
+#ifndef JAM_THRESHOLD_AMPS
+#define JAM_THRESHOLD_AMPS 0.1f
+#endif
+
+#ifndef JAM_CONSECUTIVE_HITS_REQUIRED
+#define JAM_CONSECUTIVE_HITS_REQUIRED 4
+#endif
+
+#ifndef CURRENT_FILTER_ALPHA
+#define CURRENT_FILTER_ALPHA 0.30f
+#endif
+
+// Must be defined in main.cpp and calibrated there.
+extern float ZERO_CURRENT_VOLTAGE;
+
+#ifndef TRAIN_MOTOR_RUN_MS
+#define TRAIN_MOTOR_RUN_MS 8000UL
+#endif
+
+#ifndef MOTOR_JOB_TICK_MS
+#define MOTOR_JOB_TICK_MS 5
+#endif
+
+// -----------------------------
+// Remote Control Settings
+// -----------------------------
+#ifndef IR_SETTLE_MS
+#define IR_SETTLE_MS 150UL
+#endif
+
+#ifndef TRAINING_ARM_MS
+#define TRAINING_ARM_MS 50UL
+#endif
+
+#ifndef REMOTE_POLL_INTERVAL_MS
+#define REMOTE_POLL_INTERVAL_MS 5UL
+#endif
+
+#ifndef REMOTE_DEBOUNCE_MS
+#define REMOTE_DEBOUNCE_MS 10UL
 #endif
 
 // ---------------------------
@@ -333,6 +361,15 @@ struct AsyncMotorJob {
     bool waitForNextHigh_AfterTreat = false;
     bool seenLowAfterTreat = false;
 
+    // Current monitoring state
+    float inst_current_amps = 0.0f;
+    float filtered_current_amps = 0.0f;
+    float peak_current_amps = 0.0f;
+    float last_voltage = 0.0f;
+    float last_delta_v = 0.0f;
+    int   last_adc = 0;
+    int   jam_consecutive_hits = 0;
+
     // Unjam / reverse state
     bool reverse_active = false;
     unsigned long reverse_start_ms = 0;
@@ -421,6 +458,14 @@ static void motor_job_reset_treat_logic() {
     g_motor_job.seenLowAfterTreat = false;
     g_motor_job.lastRotary = readPCF8574Pin(PIN_ROTARY);
 
+    g_motor_job.inst_current_amps = 0.0f;
+    g_motor_job.filtered_current_amps = 0.0f;
+    g_motor_job.peak_current_amps = 0.0f;
+    g_motor_job.last_voltage = 0.0f;
+    g_motor_job.last_delta_v = 0.0f;
+    g_motor_job.last_adc = 0;
+    g_motor_job.jam_consecutive_hits = 0;
+
     // legacy mirrors for compatibility/debug
     treatDispensed = false;
     lhTransitions = 0;
@@ -483,6 +528,17 @@ static void motor_job_finish(MotorStopReason reason) {
     g_motor_job.active = false;
     g_motor_job.reverse_active = false;
 
+    // ---- ONLY SERIAL PRINT LEFT ----
+    Serial.printf(
+        "RUN SUMMARY: peak=%.2fA filtered=%.2fA inst=%.2fA zero=%.3fV retries=%d reason=%d\r\n",
+        g_motor_job.peak_current_amps,
+        g_motor_job.filtered_current_amps,
+        g_motor_job.inst_current_amps,
+        ZERO_CURRENT_VOLTAGE,
+        g_motor_job.jam_retries,
+        (int)reason
+    );
+
     if (g_motor_job.done_cb) {
         MotorJobDoneCb cb = g_motor_job.done_cb;
         g_motor_job.done_cb = nullptr;
@@ -509,7 +565,7 @@ static void motor_job_tick(lv_timer_t* timer) {
     }
 
     if ((now - g_motor_job.start_ms) >= g_motor_job.timeout_ms) {
-        Serial.println("Motor timeout reached (current monitoring ended).");
+        Serial.println("Motor timeout reached.");
         motor_job_finish(STOP_TIMEOUT);
         return;
     }
@@ -519,6 +575,7 @@ static void motor_job_tick(lv_timer_t* timer) {
         if ((now - g_motor_job.reverse_start_ms) >= MOTOR_UNJAM_REVERSE_MS) {
             g_motor_job.reverse_active = false;
             g_motor_job.jam_rearm_after_ms = now + MOTOR_JAM_REARM_MS;
+            g_motor_job.jam_consecutive_hits = 0;
 
             Motor_Start();
             g_motor_job.ir_valid_after_ms = now + IR_SETTLE_MS;
@@ -530,33 +587,44 @@ static void motor_job_tick(lv_timer_t* timer) {
     }
 
     // Current monitoring while motor runs (averaged ADC)
-    int adcValue = read_current_sensor_adc_avg();
-    float voltage = adc_to_voltage(adcValue);
-    float current = voltage_to_current_amps(voltage);
+    const int adcValue = read_current_sensor_adc_avg();
+    const float voltage = adc_to_voltage(adcValue);
+    const float delta_v = voltage - ZERO_CURRENT_VOLTAGE;
+    const float inst_current = voltage_to_current_amps(voltage);
 
-    static unsigned long last_current_print_ms = 0;
-    if (now - last_current_print_ms >= 250UL) {
-        last_current_print_ms = now;
-        Serial.printf("Motor current: ADC(avg %d)=%d, V=%.3f, I=%.2fA, threshold=%.2fA, reverse=%d, retries=%d\r\n",
-                      (int)CURRENT_SENSOR_AVG_SAMPLES,
-                      adcValue,
-                      voltage,
-                      current,
-                      (float)JAM_THRESHOLD_AMPS,
-                      g_motor_job.reverse_active ? 1 : 0,
-                      g_motor_job.jam_retries);
+    if (g_motor_job.filtered_current_amps <= 0.0001f) {
+        g_motor_job.filtered_current_amps = inst_current;
+    } else {
+        g_motor_job.filtered_current_amps =
+            (CURRENT_FILTER_ALPHA * inst_current) +
+            ((1.0f - CURRENT_FILTER_ALPHA) * g_motor_job.filtered_current_amps);
     }
 
-    // Allow a short ignore period after resuming from reverse
-    if (now >= g_motor_job.jam_rearm_after_ms) {
-        if (current > JAM_THRESHOLD_AMPS) {
-            g_motor_job.jam_retries++;
+    if (inst_current > g_motor_job.peak_current_amps) {
+        g_motor_job.peak_current_amps = inst_current;
+    }
 
-            Serial.printf("STALL/JAM detected! ADC(avg %d)=%d, V=%.3f, I=%.2fA, retry %d/%d\r\n",
-                          (int)CURRENT_SENSOR_AVG_SAMPLES,
-                          adcValue,
-                          voltage,
-                          current,
+    g_motor_job.inst_current_amps = inst_current;
+    g_motor_job.last_voltage = voltage;
+    g_motor_job.last_delta_v = delta_v;
+    g_motor_job.last_adc = adcValue;
+
+        // Jam detection: use filtered current and require consecutive hits
+    if (now >= g_motor_job.jam_rearm_after_ms) {
+        if (g_motor_job.filtered_current_amps > JAM_THRESHOLD_AMPS) {
+            g_motor_job.jam_consecutive_hits++;
+        } else {
+            g_motor_job.jam_consecutive_hits = 0;
+        }
+
+        if (g_motor_job.jam_consecutive_hits >= JAM_CONSECUTIVE_HITS_REQUIRED) {
+            g_motor_job.jam_retries++;
+            g_motor_job.jam_consecutive_hits = 0;
+
+            Serial.printf("STALL/JAM detected! I=%.2fA Ifilt=%.2fA Ipeak=%.2fA retry %d/%d\r\n",
+                          g_motor_job.inst_current_amps,
+                          g_motor_job.filtered_current_amps,
+                          g_motor_job.peak_current_amps,
                           g_motor_job.jam_retries,
                           MOTOR_MAX_UNJAM_RETRIES);
 
@@ -648,21 +716,27 @@ static void motor_job_tick(lv_timer_t* timer) {
 static lv_timer_t* remote_poll_timer = NULL;
 
 static inline bool remote_p7_edge_pressed(unsigned long now_ms) {
-    bool raw = !readPCF8574Pin(PIN_REMOTE); // active-low
+    bool raw = !readPCF8574Pin(PIN_REMOTE); // active-low, pressed = true
+
     static bool last_raw = false;
-    static bool last_stable = false;
-    static unsigned long t_change = 0;
+    static bool stable_state = false;
+    static unsigned long last_change_ms = 0;
 
     if (raw != last_raw) {
         last_raw = raw;
-        t_change = now_ms;
+        last_change_ms = now_ms;
     }
 
-    if ((now_ms - t_change) > 30UL) {
-        bool prev = last_stable;
-        last_stable = raw;
-        return (last_stable && !prev);
+    if ((now_ms - last_change_ms) >= REMOTE_DEBOUNCE_MS) {
+        if (stable_state != raw) {
+            bool previous_stable = stable_state;
+            stable_state = raw;
+            if (stable_state && !previous_stable) {
+                return true;
+            }
+        }
     }
+
     return false;
 }
 
@@ -718,9 +792,11 @@ static void remote_poll_tick(lv_timer_t* t) {
 
 static void ensure_remote_poll_timer_running() {
     if (!remote_poll_timer) {
-        setPCF8574Pin(PIN_REMOTE, false);
-        remote_poll_timer = lv_timer_create(remote_poll_tick, 25, NULL);
-        Serial.println("Remote poll timer started (P7 training trigger)");
+        setPCF8574Pin(PIN_REMOTE, false); // release pin for input
+        remote_poll_timer = lv_timer_create(remote_poll_tick, REMOTE_POLL_INTERVAL_MS, NULL);
+        Serial.printf("Remote poll timer started (P7 training trigger), poll=%lu ms, debounce=%lu ms\r\n",
+                      (unsigned long)REMOTE_POLL_INTERVAL_MS,
+                      (unsigned long)REMOTE_DEBOUNCE_MS);
     }
 }
 
@@ -1284,7 +1360,14 @@ static void train_dispense_tick(lv_timer_t * timer) {
 // Actions (LVGL events)
 // ---------------------------
 extern "C" void actions_init() {
+    Wire.setClock(400000);
     ensure_remote_poll_timer_running();
+    Serial.printf("Current config: ZERO=%.3fV SENS=%.3fV/A AVG=%d JAM=%.2fA FILTER_ALPHA=%.2f\r\n",
+                  ZERO_CURRENT_VOLTAGE,
+                  SENSITIVITY,
+                  (int)CURRENT_SENSOR_AVG_SAMPLES,
+                  (float)JAM_THRESHOLD_AMPS,
+                  (float)CURRENT_FILTER_ALPHA);
 }
 
 // Manual treat behavior
